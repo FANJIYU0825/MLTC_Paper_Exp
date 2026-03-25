@@ -8,7 +8,13 @@ from tqdm.auto import tqdm
 from abc import ABC, abstractmethod
 from util.logger import logger
 from .experence import debug_plot_gmm,visualize_gmm
+import pickle
 
+
+def save_logits(logits, labels,index,loss, filename):
+    """將 logits、labels 和 indices 儲存為 .npz 檔案"""
+    np.savez(filename, logits=logits, labels=labels,loss = loss, indices=index)
+    print(f"Logits saved to {filename}")
 class MathUtils:
     @staticmethod
     def sanitize_array(x, fill_for_nonfinite=0.0):
@@ -33,23 +39,44 @@ class MathUtils:
             return (arr_clipped - min_val) / (max_val - min_val)
         return np.zeros_like(arr)
     @staticmethod
-    def minmax_normalize_columnwise(matrix):
-        """
-        label_wise normalize_array
+    # def minmax_normalize_columnwise(matrix):
+    #     """
+    #     label_wise normalize_array
         
-        """
-        # 避免修改原始數據
+    #     """
+    #     # 避免修改原始數據
+    #     out = matrix.astype(float, copy=True)
+    #     # 針對每一行 (Column) 找 min 和 max
+    #     min_vals = out.min(axis=0)
+    #     max_vals = out.max(axis=0)
+        
+    #     # 避免除以 0 (如果該標籤所有分數都一樣)
+    #     range_vals = max_vals - min_vals
+    #     range_vals[range_vals == 0] = 1e-8 
+        
+    #     # Broadcasting 運算: (N, C) - (C,) / (C,)
+    #     out = (out - min_vals) / range_vals
+    #     return out
+    def minmax_normalize_columnwise(matrix):
         out = matrix.astype(float, copy=True)
-        # 針對每一行 (Column) 找 min 和 max
+        
+        # 保護：確保至少是 2D，才能做 column-wise 操作
+        squeezed = out.ndim == 1
+        if squeezed:
+            out = out.reshape(-1, 1)
+        
         min_vals = out.min(axis=0)
         max_vals = out.max(axis=0)
         
-        # 避免除以 0 (如果該標籤所有分數都一樣)
         range_vals = max_vals - min_vals
-        range_vals[range_vals == 0] = 1e-8 
+        range_vals[range_vals == 0] = 1e-8
         
-        # Broadcasting 運算: (N, C) - (C,) / (C,)
         out = (out - min_vals) / range_vals
+        
+        # 還原原本的形狀
+        if squeezed:
+            out = out.squeeze(1)
+        
         return out
 
 class BaseScoreCalculator(ABC):
@@ -93,15 +120,16 @@ class RankWeightedLossCalculator(BaseScoreCalculator):
     """計算 Rank-based Weighted Loss"""
     def __init__(self, theta=3.0):
         self.theta = theta
-
+    
     def _calculate_rank_weight(self, logits):
         B, C = logits.shape
         idx_sorted = torch.argsort(logits, dim=1, descending=True)
+        
         ranks = torch.empty_like(idx_sorted, dtype=torch.float, device=logits.device)
         base = torch.arange(1, C + 1, device=logits.device, dtype=torch.float).unsqueeze(0).expand(B, -1)
         ranks.scatter_(dim=1, index=idx_sorted, src=base)
         
-        w = torch.log(ranks) + 1.0
+        w = torch.log10(ranks) + 1.0
         theta_tensor = torch.full_like(w, float(self.theta))
         w = torch.minimum(w, theta_tensor)
         return w
@@ -111,29 +139,45 @@ class RankWeightedLossCalculator(BaseScoreCalculator):
         scores = []
         indices = []
         labels = []
+        all_losses = []  # 儲存 Loss
+        all_logits = []  # 儲存 Logits
+        
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Calculating Rank Weighted Loss"):
                 b_input_ids = batch['input_ids'].to(device)
                 b_attn_mask = batch['attention_mask'].to(device)
                 b_labels = batch['labels'].to(device)
                 b_idx = batch['index']
-           
+                
                 logits, _ = model(input_ids=b_input_ids, attention_mask=b_attn_mask)
+                
                 loss = F.binary_cross_entropy_with_logits(logits, b_labels.float(), reduction='none')
                 
                 weights = self._calculate_rank_weight(logits=logits)
-
-                weighted_loss = loss * weights
+          
+                weighted_loss = torch.clamp(loss * weights, max=self.theta)
 
                 scores.append(weighted_loss.cpu().numpy()) 
+                
+                # --- 修正這裡 ---
+                all_losses.append(loss.cpu().numpy())    # 把 loss 加到 all_losses
+                all_logits.append(logits.cpu().numpy())  # 把 logits 加到 all_logits
+                # ----------------
+                
                 indices.extend(b_idx.numpy())
                 labels.append(b_labels.cpu().numpy())
-        scores_np = np.vstack(scores)
+                
+        # 轉換與堆疊
         indices_np = np.array(indices)
+        scores_np = np.vstack(scores)
         labels_np = np.vstack(labels)
+        
+        logits_np = np.vstack(all_logits)
+        logss_np = np.vstack(all_losses)  # 現在這裡不會報錯了，因為裡面有資料
+        save_logits(logits_np, labels_np, indices_np,logss_np, filename=f"rank_weighted_logits.npz")
         print(f"Debug Calculator Output:")
-        print(f"  - Scores shape: {scores_np.shape}") # 應該是 (53840, 54)
-        print(f"  - Indices shape: {indices_np.shape}") # 應該是 (53840,)
+        print(f"  - Scores shape: {scores_np.shape}") # matric(54840, 54)
+        print(f"  - Indices shape: {indices_np.shape}") #  (54840,)
         
         return indices_np, scores_np, labels_np
 
@@ -146,16 +190,19 @@ class PrototypeDistanceCalculator(BaseScoreCalculator):
 
     def _get_threshold(self, logit_list):
         arr = MathUtils.sanitize_array(np.array(logit_list).reshape(-1))
-        if arr.size == 0: return 1.0
-        mean_logit = arr.mean()
-        if mean_logit == 0 or not np.isfinite(mean_logit): return 1.0
-        record = [(x / mean_logit) if x > mean_logit else 1.0 for x in arr if np.isfinite(x)]
-        return float(np.mean(record)) if len(record) else 1.0
+        if arr.size == 0: return 0.5
+        # 論文 Eq.(10-11): 使用 sigmoid 機率而非 raw logits
+        probs = 1.0 / (1.0 + np.exp(-arr))  # sigmoid → [0, 1]
+        y_bar = probs.mean()
+        if y_bar < 1e-8: return 0.5
+        w = np.maximum(1.0, probs / y_bar)   # Eq.(11): wi = max(1, Ŷi,j / Ȳj)
+        hj = float((w * probs).mean())        # Eq.(10): hj = weighted avg
+        return hj
 
     def _build_prototypes(self, model, dataloader, device):
         feature_dict = {idx: None for idx in range(self.args.label_size)}
         logit_dict = {idx: None for idx in range(self.args.label_size)}
-        
+
         model.eval()
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Collecting features for Prototypes"):
@@ -163,12 +210,19 @@ class PrototypeDistanceCalculator(BaseScoreCalculator):
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device).float()
-                
+
                 # 假設 forward 回傳 (logits, features)
                 logits, features = model(input_ids=input_ids, attention_mask=attention_mask)
-                
-                B, H = features.shape
-                C = self.args.label_size
+
+                # 支援兩種 features 格式
+                if features.ndim == 3:
+                    # MltcLWAN: [B, L, H]
+                    B, C, H = features.shape
+                else:
+                    # Mltc (CLS): [B, H]
+                    B, H = features.shape
+                    C = self.args.label_size
+
                 rep_np = features.cpu().numpy()
                 log_np = logits.cpu().numpy()
                 lab_np = labels.cpu().numpy()
@@ -176,7 +230,14 @@ class PrototypeDistanceCalculator(BaseScoreCalculator):
                 for b in range(B):
                     for c in range(C):
                         if lab_np[b, c] == 1:
-                            vec = rep_np[b:b+1, :]
+                            # 根據 features 維度取出對應的 vector
+                            if features.ndim == 3:
+                                # MltcLWAN: 取 label c 的專屬 feature
+                                vec = rep_np[b:b+1, c, :]  # [1, H]
+                            else:
+                                # Mltc: 取共用的 [CLS] feature
+                                vec = rep_np[b:b+1, :]  # [1, H]
+
                             lg = log_np[b:b+1, c:c+1]
                             if feature_dict[c] is None:
                                 feature_dict[c] = vec
@@ -189,81 +250,150 @@ class PrototypeDistanceCalculator(BaseScoreCalculator):
         for key in feature_dict.keys():
             feat_list = feature_dict[key]
             log_list = logit_dict[key]
-            if log_list is None: log_list = np.random.rand(1)
+            if log_list is None: log_list = np.zeros(1)  # fix: 不用 random，語意為「無資料」
             thr = self._get_threshold(log_list)
-            
+
             # Get single prototype
             if feat_list is None:
-                proto = np.zeros(features.shape[1])
+                proto = np.zeros(features.shape[-1])  # fix: shape[-1] 相容 2D/3D features
             else:
-                # 簡化的 prototype 計算
                 logs = MathUtils.sanitize_array(np.array(log_list).reshape(-1), -np.inf)
+                probs = 1.0 / (1.0 + np.exp(-logs))  # fix: sigmoid → 與 thr 同單位 (Eq.9)
                 feats = MathUtils.sanitize_array(np.array(feat_list))
-                mask = logs > float(thr)
+                mask = probs > float(thr)
                 if np.any(mask):
                     cand = feats[mask]
                     proto = np.nanmean(cand, axis=0) if cand.size > 0 else np.nanmean(feats, axis=0)
                 else:
                     proto = np.nanmean(feats, axis=0)
-                
+
             self.prototype_dict[key] = np.nan_to_num(proto)
 
     def _compute_vectorized_cd(self, features, device):
-        B, H = features.shape
-        C = len(self.prototype_dict)
-        protos = []
-        for i in range(C):
-            p = self.prototype_dict.get(i)
-            if p is None: p = np.zeros(H)
-            protos.append(torch.tensor(p, dtype=features.dtype, device=device))
-        
-        protos_tensor = torch.stack(protos) # [C, H]
-        # features [B, 1, H], protos [1, C, H]
-        sim = F.cosine_similarity(features.unsqueeze(1), protos_tensor.unsqueeze(0), dim=2, eps=1e-8)
-        # dist = 1.0 - sim
-        dist = -1*sim
-        
-        # Handle empty prototypes (masking)
-        has_proto = (protos_tensor.abs().sum(dim=1) > 0).float().unsqueeze(0)
-        dist = dist * has_proto + (1.0 - has_proto) * 1.0
+        """
+        計算 Prototype Distance (CD)
+        範圍限制在 0 ~ -1 (越負代表越接近原型)
+        """
+        if features.ndim == 3:
+            # ─── MltcLWAN: [B, L, H] ───
+            B, L, H = features.shape
+            C = len(self.prototype_dict)
+            dist = torch.zeros(B, C, device=device)
+
+            for l in range(C):
+                feat_l = features[:, l, :]
+                p = self.prototype_dict.get(l)
+                
+                if p is None or np.abs(p).sum() == 0:
+                    # 無原型時，距離為 0 (代表最不相似/最遠)
+                    dist[:, l] = 0.0
+                else:
+                    proto_l = torch.tensor(p, dtype=feat_l.dtype, device=device)
+                    sim = F.cosine_similarity(feat_l, proto_l.unsqueeze(0).expand(B, -1), dim=1, eps=1e-8)
+                    
+                    # 論文邏輯: -cos，且限制在 0 到 -1
+                    dist[:, l] = -1.0 * torch.clamp(sim, min=0.0, max=1.0)
+
+        else:
+            # ─── Mltc (CLS): [B, H] ───
+            B, H = features.shape
+            C = len(self.prototype_dict)
+            protos = []
+            for i in range(C):
+                p = self.prototype_dict.get(i)
+                if p is None: p = np.zeros(H)
+                protos.append(torch.tensor(p, dtype=features.dtype, device=device))
+
+            protos_tensor = torch.stack(protos)  # [C, H]
+            sim = F.cosine_similarity(features.unsqueeze(1), protos_tensor.unsqueeze(0), dim=2, eps=1e-8)
+            
+            # 限制範圍並取負號
+            dist = -1.0 * torch.clamp(sim, min=0.0, max=1.0)
+
+            # Handle empty prototypes: 沒有原型的類別距離設為 0
+            has_proto = (protos_tensor.abs().sum(dim=1) > 0).float().unsqueeze(0)
+            dist = dist * has_proto + (1.0 - has_proto) * 0.0
+
         return dist
 
     def calculate(self, model, dataloader, device):
-        # 1. Build Prototypes first
         self._build_prototypes(model, dataloader, device)
         
-        # 2. Compute Distances
         model.eval()
         scores = []
         indices = []
         labels = []
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Calculating Prototype Distance"):
-                b_input_ids = batch['input_ids'].to(device)
-                b_attn_mask = batch['attention_mask'].to(device)
                 b_labels = batch['labels'].to(device)
                 b_idx = batch['index']
                 
-                _, features = model(input_ids=b_input_ids, attention_mask=b_attn_mask)
+                # 取得原始特徵並計算 dist (範圍 0 ~ -1)
+                _, features = model(input_ids=batch['input_ids'].to(device), 
+                                    attention_mask=batch['attention_mask'].to(device))
+                dists = self._compute_vectorized_cd(features, device)  # [B, C]
                 
-                # 計算距離矩陣 [B, C]
-                dists = self._compute_vectorized_cd(features, device)
+                lab_np = b_labels.cpu().numpy()
+                dist_np = dists.cpu().numpy()
                 
-                # 這裡使用 Sum 作為該樣本的整體分數 (保持與 REL 一致)
-                # dists = torch.clamp(dists, 0.0, 1.0)
-                
-                
-                scores.append(dists.cpu().numpy())
+                # ─── 關鍵翻轉邏輯 ───
+                # lab=1 (正類): dist * (1)  -> 範圍 [-1, 0] (TP 靠近 -1, FP 靠近 0)
+                # lab=0 (負類): dist * (-1) -> 範圍 [0, 1]  (TN 靠近 0, FN 靠近 1)
+                masked_dists = dist_np * (2 * lab_np - 1)
+
+                scores.append(masked_dists)
                 indices.extend(b_idx.numpy())
-                labels.append(b_labels.cpu().numpy())
-                
+                labels.append(lab_np)
 
-        scores_np = np.vstack(scores)
-        labels_np = np.vstack(labels)
-        indices_np = np.array(indices)
-        return indices_np, scores_np, labels_np
-    
+        return np.array(indices), np.vstack(scores), np.vstack(labels)
+class HSMHybridPipeline:
+    """
+    專門處理 HSM 這種需要結合兩種分數的複雜流程
+    這是一個更高階的 Orchestrator
+    """
+    def __init__(self, rel_calculator, cd_calculator, alpha=0.5):
+        self.rel_calc = rel_calculator
+        self.cd_calc = cd_calculator
+        
+        self.alpha = alpha
 
+
+
+
+    def run_score_only(self, model, dataloader, device, encoder_name='mltc'):
+        """只計算並融合分數，不進行篩選/校正 (為了外部參數搜尋用)"""
+        print("🚀 Pipeline: Calculating Scores Only...")
+
+        # 1. 計算
+        idx1, rel_scores, labels = self.rel_calc.calculate(model, dataloader, device)
+        idx_c, cd_scores, labels = self.cd_calc.calculate(model, dataloader, device)
+
+        # 2. 歸一化
+        rel_norm = MathUtils.minmax_normalize_columnwise(rel_scores)
+        cd_norm = MathUtils.minmax_normalize_columnwise(cd_scores)
+
+        # 根據 encoder 名稱保存不同的文件
+        save_path = f"data/evaluation_results_{encoder_name}.npz"
+
+        # 使用 np.savez_compressed 來打包儲存多個陣列
+        np.savez_compressed(
+            save_path,
+            idx_rel=idx1,           # 將 idx1 存為名稱 'idx_rel'
+            rel_scores=rel_scores,  # 將 rel_scores 存為名稱 'rel_scores'
+            idx_cd=idx_c,           # 將 idx_c 存為名稱 'idx_cd'
+            cd_scores=cd_scores,    # 將 cd_scores 存為名稱 'cd_scores'
+            labels=labels      # 由於兩個 labels 通常是一樣的 ground truth，存一個代表即可
+        )
+
+        print(f"太棒了！所有預測結果與標籤已成功壓縮並儲存至：{save_path}")
+        
+                # 3. 融合
+        hsm_scores = rel_norm * self.alpha + cd_norm * (1 - self.alpha)
+        
+        # 回傳分數，讓外部迴圈去決定怎麼切
+        return hsm_scores, labels, idx1
+
+  
 class GMMNoiseFilter(BaseNoiseFilter):
     """使用 GMM 二分法進行篩選"""
     def __init__(self, n_components=2, threshold=0.5):
@@ -317,9 +447,9 @@ class GMMNoiseFilter(BaseNoiseFilter):
         noisy_indices = indices[~is_clean]
         
         print(f"[{self.__class__.__name__}] Filter Report:")
-        print(f"  - Total: {len(indices)}")
-        print(f"  - Clean: {len(clean_indices)} ({len(clean_indices)/len(indices):.2%})")
-        print(f"  - Noisy: {len(noisy_indices)} ({len(noisy_indices)/len(indices):.2%})")
+        # print(f"  - Total: {len(indices)}")
+        # print(f"  - Clean: {len(clean_indices)} ({len(clean_indices)/len(indices):.2%})")
+        # print(f"  - Noisy: {len(noisy_indices)} ({len(noisy_indices)/len(indices):.2%})")
         
         return clean_indices, noisy_indices
     
@@ -339,9 +469,9 @@ class GMMNoiseFilter(BaseNoiseFilter):
         probs_all = gmm.predict_proba(data)
         
         # 回傳 "屬於乾淨群" 的機率
-        return probs_all[:,0]
+        return probs_all[:, clean_comp_idx]
     
-    def _apply_band_correction_analyzed(probs, y_noisy, args, y_clean):
+    # def _apply_band_correction_analyzed(probs, y_noisy, args, y_clean):
         """
         probs:    校正階段的預測機率
         y_noisy:  混入雜訊階段的標籤 (Input)
@@ -390,24 +520,24 @@ class GMMNoiseFilter(BaseNoiseFilter):
         }
 
         # 4. 漂亮的打印輸出
-        print(f"\n{'='*10} Correction Analysis {'='*10}")
-        print(f"Total Samples: {len(y_clean)}")
+        # print(f"\n{'='*10} Correction Analysis {'='*10}")
+        # print(f"Total Samples: {len(y_clean)}")
         
-        print(f"\n[🟢 Success - 雜訊成功被移除]")
-        print(f"  101 (原本是1, 變成0, 修回1): {stats['101 (校正對了)']}")
-        print(f"  010 (原本是0, 變成1, 修回0): {stats['010 (校正對了)']}")
+        # print(f"\n[🟢 Success - 雜訊成功被移除]")
+        # print(f"  101 (原本是1, 變成0, 修回1): {stats['101 (校正對了)']}")
+        # print(f"  010 (原本是0, 變成1, 修回0): {stats['010 (校正對了)']}")
         
-        print(f"\n[🔴 Damage - 乾淨資料被改壞]")
-        print(f"  110 (原本是1, 沒變, 卻改成0): {stats['110 (校正錯了)']}")
-        print(f"  001 (原本是0, 沒變, 卻改成1): {stats['001 (校正錯了)']}")
+        # print(f"\n[🔴 Damage - 乾淨資料被改壞]")
+        # print(f"  110 (原本是1, 沒變, 卻改成0): {stats['110 (校正錯了)']}")
+        # print(f"  001 (原本是0, 沒變, 卻改成1): {stats['001 (校正錯了)']}")
         
-        print(f"\n[⚠️ Missed - 雜訊依然存在]")
-        print(f"  100 (原本是1, 變成0, 沒修回來): {stats['100 (沒校正到)']}")
-        print(f"  011 (原本是0, 變成1, 沒修回來): {stats['011 (沒校正到)']}")
+        # print(f"\n[⚠️ Missed - 雜訊依然存在]")
+        # print(f"  100 (原本是1, 變成0, 沒修回來): {stats['100 (沒校正到)']}")
+        # print(f"  011 (原本是0, 變成1, 沒修回來): {stats['011 (沒校正到)']}")
         
-        print(f"\n[⚪ Keep - 正確保持不動]")
-        print(f"  111 & 000 (資料原本乾淨且未被修改): {stats['111 (不需要校正)'] + stats['000 (不需要校正)']}")
-        print(f"{'='*40}\n")
+        # print(f"\n[⚪ Keep - 正確保持不動]")
+        # print(f"  111 & 000 (資料原本乾淨且未被修改): {stats['111 (不需要校正)'] + stats['000 (不需要校正)']}")
+        # print(f"{'='*40}\n")
 
         return y_corrected_soft
     def _apply_band_correction(self, probs,y, args):
@@ -494,8 +624,8 @@ class GMMNoiseFilter(BaseNoiseFilter):
             num_neg = np.sum(labels[:, label] == 0)
             num_pos_corrected = np.sum(corrected_labels[:, label] == 1)
             num_neg_corrected = np.sum(corrected_labels[:, label] == 0)
-            logger.info(f"  [Label {label} Correction Report]")
-            logger.info(f"    - Original Positives: {num_pos}, Negatives: {num_neg}")
+            # logger.info(f"  [Label {label} Correction Report]")
+            # logger.info(f"    - Original Positives: {num_pos}, Negatives: {num_neg}")
             # 訂正結果 origin -flip
             pos_flip_neg= np.sum((labels[:, label] == 1) & (corrected_labels[:, label] == 0))
             neg_flip_pos= np.sum((labels[:, label] == 0) & (corrected_labels[:, label] == 1))
@@ -552,7 +682,7 @@ class GMMNoiseFilter(BaseNoiseFilter):
             pos_scores_c = col_scores[pos_mask]
             
             # 只有當該類別的正樣本夠多時，才跑 GMM (避免 sample 太少 GMM 炸開)
-            target_watch_list = [0,1,3,4,5,6,8,9,11,12,13,14]  # 你可以指定一些類別來畫圖檢查
+            target_watch_list = args.targert_list  # 你可以指定一些類別來畫圖檢查
             if len(pos_scores_c) > 1:
                 prob_clean = self._run_gmm_on_subset(pos_scores_c)
                 if c in target_watch_list:
@@ -609,72 +739,181 @@ class GMMNoiseFilter(BaseNoiseFilter):
         
         return refined_labels
     
-# 負責提取分數並篩選雜訊的 Pipeline   
-class NoiseSelectionPipeline:
-    def __init__(self, calculator: BaseScoreCalculator, filter_strategy: BaseNoiseFilter):
-        self.calculator = calculator
-        self.filter_strategy = filter_strategy
+class LabelRefiner:
+    def __init__(self, n_components=2, random_state=0):
+        self.n_components = n_components
+        self.random_state = random_state
+        
+        
+    def _run_gmm(self, scores_subset):
+        """執行 GMM 並回傳各樣本屬於不同成分的機率"""
+        if len(scores_subset) <= self.n_components:
+            return None
+            
+        data = scores_subset.reshape(-1, 1)
+        gmm = GMM(
+            n_components=self.n_components, 
+            max_iter=100, 
+            tol=1e-2, 
+            reg_covar=5e-4, 
+            random_state=self.random_state
+        )
+        gmm.fit(data)
+        
+        # 排序 Means：索引 0 永遠是 Low Loss (Clean)
+        sorted_indices = np.argsort(gmm.means_.flatten())
+        probs_all = gmm.predict_proba(data)
+        
+        # 回傳字典，方便後續擴張
+        result = {
+            'clean_probs': probs_all[:, sorted_indices[0]],
+            'noisy_probs': probs_all[:, sorted_indices[-1]], # 最後一個永遠是最高 Loss
+        }
+        # 通用處理中間群 (支援 3, 4, 5+ components)
+        mid_indices = sorted_indices[1:-1]
+        if len(mid_indices) == 1:
+            # 3-comp: 保持向後相容，使用 'mid_probs' key
+            result['mid_probs'] = probs_all[:, mid_indices[0]]
+        else:
+            # 4, 5+ comp: 使用 'mid_probs_0', 'mid_probs_1', ...
+            for i, mid_idx in enumerate(mid_indices):
+                result[f'mid_probs_{i}'] = probs_all[:, mid_idx]
+            
+        return result
 
-    def run(self, model, dataloader, device):
-        print("1. Calculating Scores...")
-        indices, scores,labels = self.calculator.calculate(model, dataloader, device)
-        
-        print("2. Filtering Noise...")
-        clean_ids, noisy_ids = self.filter_strategy.filter(scores, indices)
-        
-        return clean_ids, noisy_ids, scores, labels
+    def _apply_correction_logic(self, prob_dict, target_y, args):
+        """
+        核心校正邏輯：
+        2-comp: 使用 epsilon band
+        3-comp: 使用最大機率所屬群集
+        4-comp: 漸進式 soft label (clean → mid-clean → mid-noisy → noisy)
+        5-comp: 漸進式 soft label (clean → mid-clean → uncertain → mid-noisy → noisy)
+        """
+        if self.n_components == 2:
+            # 原本的 Epsilon 邏輯
+            probs = prob_dict['clean_probs']
+            probs = np.nan_to_num(probs, nan=0.5)
+            
+            # y=1 時: Clean(1), Noisy(0), Band(prob)
+            # y=0 時: Clean(0), Noisy(1), Band(1-prob)
+            out = np.where(probs > 0.5 + args.epsilon, target_y,
+                  np.where(probs < 0.5 - args.epsilon, 1.0 - target_y, 
+                  probs if target_y == 1.0 else 1.0 - probs))
+            return out
+            
+        elif self.n_components == 3:
+            # 3-comp 自動化邏輯
+            p_clean = prob_dict['clean_probs']
+            p_mid = prob_dict['mid_probs']
+            p_noisy = prob_dict['noisy_probs']
+            
+            stack = np.vstack([p_clean, p_mid, p_noisy])
+            winners = np.argmax(stack, axis=0)
+            
+            out = np.zeros_like(p_clean)
+            out[winners == 0] = target_y      # 歸類為乾淨
+            out[winners == 2] = 1.0 - target_y # 歸類為雜訊
+            out[winners == 1] = 0.5            # 歸類為模糊
+            return out
 
-class HSMHybridPipeline:
-    """
-    專門處理 HSM 這種需要結合兩種分數的複雜流程
-    這是一個更高階的 Orchestrator
-    """
-    def __init__(self, rel_calculator, cd_calculator, filter_strategy, alpha=0.5):
-        self.rel_calc = rel_calculator
-        self.cd_calc = cd_calculator
-        self.filter_strategy = filter_strategy
-        self.alpha = alpha
+        elif self.n_components == 4:
+            # 4-comp 漸進式邏輯：clean / mid-clean / mid-noisy / noisy
+            p_clean = prob_dict['clean_probs']
+            p_mid_clean = prob_dict['mid_probs_0']
+            p_mid_noisy = prob_dict['mid_probs_1']
+            p_noisy = prob_dict['noisy_probs']
 
-    def run(self, model, dataloader, device):
-        print("🚀 Starting HSM Hybrid Selection...")
-        
-        # 1. 分別計算兩種分數
-        idx1, rel_scores,labels = self.rel_calc.calculate(model, dataloader, device)
-        # 注意: 這裡假設 dataloader 順序固定，idx1 應該等於 idx2。
-        # 嚴謹作法應該要做 index matching，這裡簡化處理。
-        _, cd_scores,_= self.cd_calc.calculate(model, dataloader, device)
-        
-        # 2. 診斷 (Optional)
-        print(f"  - REL Max: {rel_scores.max():.4f}, Mean: {rel_scores.mean():.4f}")
-        print(f"  - CD Max: {cd_scores.max():.4f}, Mean: {cd_scores.mean():.4f}")
-        
-        # 3. 歸一化
-        rel_norm = MathUtils.minmax_normalize_columnwise(rel_scores)
-        cd_norm = MathUtils.minmax_normalize_columnwise(cd_scores)
-        
-        # 4. 融合 (Fusion)
-        final_score = rel_norm * self.alpha + cd_norm * (1 - self.alpha)
-        final_scores = final_score
-        clean_ids, noisy_ids = self.filter_strategy.filter(final_scores, idx1)
-        # 5. 篩選
-        return clean_ids, noisy_ids, final_scores, labels
+            stack = np.vstack([p_clean, p_mid_clean, p_mid_noisy, p_noisy])
+            winners = np.argmax(stack, axis=0)
 
+            # 漸進 soft label: target_y → 0.7 → 0.3 → 1-target_y
+            gradient = [target_y, 0.7 if target_y == 1.0 else 0.3,
+                        0.3 if target_y == 1.0 else 0.7, 1.0 - target_y]
+            out = np.zeros_like(p_clean)
+            for i, val in enumerate(gradient):
+                out[winners == i] = val
+            return out
 
-    def run_score_only(self, model, dataloader, device):
-        """只計算並融合分數，不進行篩選/校正 (為了外部參數搜尋用)"""
-        print("🚀 Pipeline: Calculating Scores Only...")
+        elif self.n_components == 5:
+            # 5-comp 漸進式邏輯：clean / mid-clean / uncertain / mid-noisy / noisy
+            p_clean = prob_dict['clean_probs']
+            p_mid_clean = prob_dict['mid_probs_0']
+            p_uncertain = prob_dict['mid_probs_1']
+            p_mid_noisy = prob_dict['mid_probs_2']
+            p_noisy = prob_dict['noisy_probs']
+
+            stack = np.vstack([p_clean, p_mid_clean, p_uncertain, p_mid_noisy, p_noisy])
+            winners = np.argmax(stack, axis=0)
+
+            # 漸進 soft label: target_y → 0.75 → 0.5 → 0.25 → 1-target_y
+            gradient = [target_y, 0.75 if target_y == 1.0 else 0.25,
+                        0.5,
+                        0.25 if target_y == 1.0 else 0.75, 1.0 - target_y]
+            out = np.zeros_like(p_clean)
+            for i, val in enumerate(gradient):
+                out[winners == i] = val
+            return out
+
+    def refine(self, scores, labels, args):
+        """
+        對多標籤/多類別進行校正
+        scores: [N, num_classes]
+        labels: [N, num_classes]
+        """
+        logger.info(f"Starting {self.n_components}-component GMM Correction...")
         
-        # 1. 計算
-        idx1, rel_scores, labels = self.rel_calc.calculate(model, dataloader, device)
-        _, cd_scores, _ = self.cd_calc.calculate(model, dataloader, device)
+        scores = np.nan_to_num(np.asarray(scores, dtype=float), nan=1.0, posinf=1.0, neginf=0.0)
+        labels = np.asarray(labels, dtype=int)
+        refined_labels = labels.astype(float).copy()
         
-        # 2. 歸一化
-        rel_norm = MathUtils.minmax_normalize_columnwise(rel_scores)
-        cd_norm = MathUtils.minmax_normalize_columnwise(cd_scores)
+        N, num_classes = scores.shape
         
-        # 3. 融合
-        hsm_scores = rel_norm * self.alpha + cd_norm * (1 - self.alpha)
-        
-        # 回傳分數，讓外部迴圈去決定怎麼切
-        return hsm_scores, labels, idx1
-# 
+        # 檢查是否有指定要繪圖的標籤列表
+        target_watch_list = getattr(args, 'targert_list', [])
+        save_dir = f"gmm_debug_plots{getattr(args, 'alpha', '')}"
+
+        for c in range(num_classes):
+            col_scores = scores[:, c]
+            col_labels = labels[:, c]
+            
+            # 建立該類別統計
+            stats = {"1->0": 0, "0->1": 0, "soft": 0, "pos_orig": 0, "neg_orig": 0}
+
+            for target_y in [1, 0]:
+                mask = (col_labels == target_y)
+                subset_scores = col_scores[mask]
+                stats["pos_orig" if target_y == 1 else "neg_orig"] = len(subset_scores)
+
+                if len(subset_scores) > self.n_components:
+                    prob_dict = self._run_gmm(subset_scores)
+                    
+                    # 如果該標籤在觀察列表中,則繪製 GMM 圖
+                    if c in target_watch_list and prob_dict is not None:
+                        subset_type = f"{'Pos' if target_y == 1 else 'Neg'}_Original{getattr(args, 'alpha', '')}"
+                        visualize_gmm(
+                            subset_scores, 
+                            class_name=c, 
+                            subset_type=subset_type,
+                            save_dir=save_dir,
+                            n_components=self.n_components
+                        )
+                    
+                    if prob_dict is not None:
+                        new_vals = self._apply_correction_logic(prob_dict, float(target_y), args)
+                        refined_labels[mask, c] = new_vals
+                        
+                        # 統計
+                        if target_y == 1:
+                            stats["1->0"] = np.sum(new_vals == 0.0)
+                        else:
+                            stats["0->1"] = np.sum(new_vals == 1.0)
+                        stats["soft"] += np.sum((new_vals > 0.0) & (new_vals < 1.0))
+
+            self._log_report(c, stats)
+
+        return refined_labels
+
+    def _log_report(self, c, stats):
+        logger.info(f" Label {c} | Orig P/N: {stats['pos_orig']}/{stats['neg_orig']} | "
+                         f"Flipped: 1->0:{stats['1->0']}, 0->1:{stats['0->1']} | Soft: {stats['soft']}")
+

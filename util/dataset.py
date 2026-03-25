@@ -80,9 +80,10 @@ def load_data_from_tsv(file_path):
 
 
 class DictDataset(Dataset):
-    def __init__(self, encodings, labels):
+    def __init__(self, encodings, labels, texts=None):
         self.enc = encodings
         self.labels = labels
+        self.texts = texts  # 新增：保存原始文本
 
     def __len__(self):
         return self.labels.shape[0]
@@ -98,6 +99,11 @@ class DictDataset(Dataset):
             item["token_type_ids"] = self.enc["token_type_ids"][idx]
         else:
             item["token_type_ids"] = torch.zeros_like(self.enc["input_ids"][idx])
+        
+        # 新增：如果有存儲文本，也返回
+        if self.texts is not None:
+            item["text"] = self.texts[idx]
+        
         return item
     
 class DatasetReassembler:
