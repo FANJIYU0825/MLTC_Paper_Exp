@@ -32,27 +32,33 @@ def create_sample_dataset(num_samples=200):
         documents.append(" ".join(doc_sentences))
     print(f"Created a sample dataset with {num_samples} documents and {num_labels} labels.")
     return documents, y_true, labels
-def load_data_from_tsv(file_path):
+def load_data_from_tsv(file_path, label_index_path=None):
     """
     從指定的 .tsv 檔案讀取資料集。
     檔案格式: '010101...[Tab]document text'
+
+    label_index_path: path to label_to_index.json; if None, inferred from the
+                      dataset directory (supports AAPD and RCV1 layouts).
     """
+    import json
+    import os
+
     documents = []
     labels_list = []
-    
+
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            
+
             try:
                 # 使用 tab 作為分隔符
                 label_str, text = line.split('\t', 1)
-                
+
                 # 將 0/1 字串轉換為 numpy 數字陣列
                 label_vector = np.array([int(char) for char in label_str])
-                
+
                 documents.append(text)
                 labels_list.append(label_vector)
             except ValueError:
@@ -64,18 +70,25 @@ def load_data_from_tsv(file_path):
 
     # 將標籤列表堆疊成一個大的 numpy 矩陣
     y_true = np.vstack(labels_list)
-    
-    
     num_labels = y_true.shape[1]
-    import json
-    with open("dataset/AAPD/label_to_index.json", "r") as f:
-            label_to_index = json.load(f)
+
+    # Resolve label_index_path: explicit > same directory > fallback to AAPD
+    if label_index_path is None:
+        dataset_dir = os.path.dirname(os.path.abspath(file_path))
+        candidate = os.path.join(dataset_dir, "label_to_index.json")
+        if os.path.exists(candidate):
+            label_index_path = candidate
+        else:
+            label_index_path = "dataset/AAPD/label_to_index.json"
+
+    with open(label_index_path, "r") as f:
+        label_to_index = json.load(f)
     index_to_name = {v: k for k, v in label_to_index.items()}
     label_names = [index_to_name[i] for i in range(num_labels)]
-                
+
     print(f"Loaded {len(documents)} documents from '{file_path}'.")
     print(f"Labels are vectors of size {num_labels}.")
-    
+
     return documents, y_true, label_names
 
 

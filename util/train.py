@@ -115,3 +115,61 @@ def train_once(model_class,args, epoch_list: list, num_labels: int, data_loader:
 
     return warmup_model
 
+
+def eval_model(model, data_loader, device):
+    """Evaluate model on a test dataloader and return metrics."""
+    from sklearn.metrics import (
+        f1_score, accuracy_score, precision_score,
+        recall_score, classification_report
+    )
+
+    model.eval()
+    all_preds, all_labels = [], []
+
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Evaluating"):
+            b_input_ids = batch['input_ids'].to(device)
+            b_attn_mask = batch['attention_mask'].to(device)
+            b_labels = batch['labels'].cpu().numpy()
+            logits, _ = model(input_ids=b_input_ids, attention_mask=b_attn_mask)
+            preds = (torch.sigmoid(logits) > 0.5).cpu().numpy().astype(int)
+            all_preds.append(preds)
+            all_labels.append(b_labels)
+
+    y_pred = np.vstack(all_preds)
+    y_true = np.vstack(all_labels)
+
+    report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+    per_class_df = pd.DataFrame(report).T
+
+    return {
+        'f1_micro':  f1_score(y_true, y_pred, average='micro',  zero_division=0),
+        'f1_macro':  f1_score(y_true, y_pred, average='macro',  zero_division=0),
+        'accuracy':  accuracy_score(y_true, y_pred),
+        'precision': precision_score(y_true, y_pred, average='micro', zero_division=0),
+        'recall':    recall_score(y_true, y_pred, average='micro', zero_division=0),
+        'per_class_df': per_class_df,
+    }
+
+
+def get_or_train_warmup_model(args, num_labels: int, data_loader: DataLoader, model_path: str, model_class=None):
+    """載入已存在的 warmup 模型，或訓練一個新的並儲存。"""
+    if model_class is None:
+        model_class = Mltc
+    warmup_model = model_class(num_labels)
+
+    if os.path.exists(model_path):
+        logger.info(f"Loading existing warmup model from {model_path}")
+        warmup_model.load_state_dict(torch.load(model_path, map_location=args.device))
+        warmup_model.to(args.device)
+    else:
+        logger.info(f"Training new warmup model, will save to {model_path}")
+        warmup_model.to(args.device)
+        warmup_model = train_bert_model(
+            warmup_model, data_loader,
+            epochs=args.epochs, device=args.device, warmup=True
+        )
+        torch.save(warmup_model.state_dict(), model_path)
+        logger.info(f"Warmup model saved to {model_path}")
+
+    return warmup_model

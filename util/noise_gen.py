@@ -11,32 +11,37 @@ def _false_negative_noise(label_list, rho_10):
 
 
 def _false_positive_noise(normalized_co_mat, label_list, rho_01):
-        
-        # np.random.seed(42)
-        fp_noise = [0] * len(label_list)
-        if sum(label_list) == 0: # Cannot generate FP noise if no positive labels exist
-            return np.array(fp_noise)
-        trans_vec = np.zeros(len(label_list))
-        for i, label in enumerate(label_list):
-            if label == 1:
-                trans_vec += normalized_co_mat[i]
-
-        # Normalize transition vector and apply noise rate
-        
-        # print('Sum of label_list:', sum(label_list))
-        # print('trans_vec',trans_vec.shape)
-        trans_vec = trans_vec / sum(label_list) * rho_01*100
-
-        # Don't flip existing positive labels
-        trans_vec[np.array(label_list) == 1] = 0
-
-        # Generate noise based on the calculated probabilities
-        for i, label in enumerate(label_list):
-            if label == 0:
-                prob = min(trans_vec[i], 1.0) # Ensure prob is not > 1
-                if np.random.binomial(1, prob) == 1:
-                    fp_noise[i] = 1 # This vector marks which '0's to add
+    fp_noise = [0] * len(label_list)
+    if sum(label_list) == 0:
         return np.array(fp_noise)
+        
+    trans_vec = np.zeros(len(label_list))
+    for i, label in enumerate(label_list):
+        if label == 1:
+            trans_vec += normalized_co_mat[i]
+
+    # 1. 先將正標籤的機率歸零，這樣它們才不會干擾後續的機率總和計算
+    trans_vec[np.array(label_list) == 1] = 0
+    
+    sum_trans = np.sum(trans_vec)
+    if sum_trans > 0:
+        # 2. 計算「這個樣本」預期應該要產生多少個 FP
+        num_neg_labels = len(label_list) - sum(label_list)
+        expected_fps_this_sample = num_neg_labels * rho_01
+        
+        # 3. 重新縮放向量，使其總和等於預期的翻轉次數
+        trans_vec = (trans_vec / sum_trans) * expected_fps_this_sample
+    else:
+        return np.array(fp_noise)
+
+    # 產生雜訊
+    for i, label in enumerate(label_list):
+        if label == 0:
+            prob = min(trans_vec[i], 1.0) # 確保機率不超過 1
+            if np.random.binomial(1, prob) == 1:
+                fp_noise[i] = 1 
+                
+    return np.array(fp_noise)
        
         
 
