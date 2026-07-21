@@ -93,10 +93,11 @@ def load_data_from_tsv(file_path, label_index_path=None):
 
 
 class DictDataset(Dataset):
-    def __init__(self, encodings, labels, texts=None):
+    def __init__(self, encodings, labels, texts=None, loss_mask=None):
         self.enc = encodings
         self.labels = labels
         self.texts = texts  # 新增：保存原始文本
+        self.loss_mask = loss_mask  # Optional [N, C] per-cell mask for BCE retrain
 
     def __len__(self):
         return self.labels.shape[0]
@@ -112,11 +113,14 @@ class DictDataset(Dataset):
             item["token_type_ids"] = self.enc["token_type_ids"][idx]
         else:
             item["token_type_ids"] = torch.zeros_like(self.enc["input_ids"][idx])
-        
+
         # 新增：如果有存儲文本，也返回
         if self.texts is not None:
             item["text"] = self.texts[idx]
-        
+
+        if self.loss_mask is not None:
+            item["loss_mask"] = self.loss_mask[idx]
+
         return item
     
 class DatasetReassembler:
@@ -124,17 +128,19 @@ class DatasetReassembler:
     職責：將原始的輸入特徵 (Input IDs, Mask) 與 '修正後的標籤' 重新組合成新的 DataLoader。
     """
     @staticmethod
-    def create_retraining_loader(encoded_inputs, corrected_labels, batch_size):
+    def create_retraining_loader(encoded_inputs, corrected_labels, batch_size,
+                                  loss_mask=None):
         """
         encoded_inputs: 包含 input_ids 和 attention_mask 的字典或 tuple (依原本 encoded_batch_train 格式而定)
         corrected_labels: Tensor, 形狀為 [num_samples, num_labels]
+        loss_mask: Optional Tensor/ndarray [num_samples, num_labels]; 1=參與 BCE, 0=丟棄
         """
         # 假設 encoded_inputs 是一個包含 (input_ids, attention_mask) 的 tuple 或 list
         # 這裡根據你原本 load_and_preprocess_data 的回傳格式進行適配
         if isinstance(encoded_inputs, (tuple, list)):
             input_ids = encoded_inputs[0]
             attention_masks = encoded_inputs[1]
-            
+
         else:
             # 若是 dict 格式
             input_ids = encoded_inputs['input_ids']
@@ -144,6 +150,9 @@ class DatasetReassembler:
         if not isinstance(corrected_labels, torch.Tensor):
             corrected_labels = torch.tensor(corrected_labels)
 
+        if loss_mask is not None and not isinstance(loss_mask, torch.Tensor):
+            loss_mask = torch.tensor(loss_mask, dtype=torch.float32)
+
         # 建立新的 Dataset
         new_encodings = {
             'input_ids': input_ids,
@@ -152,9 +161,9 @@ class DatasetReassembler:
             # 'labels': labels,
             # 'index': indexs
         }
-        retrain_data = DictDataset(new_encodings, corrected_labels)
+        retrain_data = DictDataset(new_encodings, corrected_labels, loss_mask=loss_mask)
 
         retrain_sampler = RandomSampler(retrain_data)
         retrain_dataloader = DataLoader(retrain_data, sampler=retrain_sampler, batch_size=batch_size)
-        
+
         return retrain_dataloader

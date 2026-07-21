@@ -7,7 +7,8 @@ from sklearn.mixture import GaussianMixture as GMM
 from tqdm.auto import tqdm
 from abc import ABC, abstractmethod
 from util.logger import logger
-from .experence import debug_plot_gmm,visualize_gmm
+from .experence import (debug_plot_gmm, visualize_gmm, visualize_2d_gmm_candidates,
+                        visualize_gmm_cluster_purity_k, visualize_1d_gmm_features)
 import pickle
 
 
@@ -34,10 +35,89 @@ class MathUtils:
         arr_clipped = np.clip(arr, a_min=None, a_max=limit)
         min_val = arr_clipped.min()
         max_val = arr_clipped.max()
-        
+
         if max_val - min_val > 1e-6:
             return (arr_clipped - min_val) / (max_val - min_val)
         return np.zeros_like(arr)
+
+    @staticmethod
+    def zscore_normalize_columnwise(matrix, clip_range=None):
+        """
+        Z-Score 標準化 (column-wise)
+        將每一個 column (標籤) 轉換為 z-score: (x - mean) / std
+
+        Args:
+            matrix: [N, C] or [N] 型態的分數矩陣
+            clip_range: Optional tuple (min, max) 限制 z-score 範圍，例如 (-5, 5)
+
+        Returns:
+            標準化後的矩陣，每個 column 的 mean≈0, std≈1
+        """
+        out = matrix.astype(float, copy=True)
+
+        # 保護：確保至少是 2D，才能做 column-wise 操作
+        squeezed = out.ndim == 1
+        if squeezed:
+            out = out.reshape(-1, 1)
+
+        # 計算每個 column 的均值和標準差
+        mean_vals = out.mean(axis=0)  # shape: (C,)
+        std_vals = out.std(axis=0)    # shape: (C,)
+
+        # 避免除以 0 (如果該標籤所有分數都一樣)
+        std_vals[std_vals < 1e-8] = 1.0
+
+        # Broadcasting 運算: (N, C) - (C,) / (C,)
+        out = (out - mean_vals) / std_vals
+
+        # Optional: 限制極端值範圍
+        if clip_range is not None:
+            out = np.clip(out, clip_range[0], clip_range[1])
+
+        # 還原原本的形狀
+        if squeezed:
+            out = out.squeeze(1)
+
+        return out
+
+    @staticmethod
+    def robust_zscore_normalize_columnwise(matrix, clip_range=None):
+        """
+        Robust Z-Score 標準化 (使用中位數和 MAD)
+        對極端值更穩健的版本
+
+        Args:
+            matrix: [N, C] or [N] 型態的分數矩陣
+            clip_range: Optional tuple (min, max) 限制 z-score 範圍
+
+        Returns:
+            標準化後的矩陣
+        """
+        out = matrix.astype(float, copy=True)
+
+        squeezed = out.ndim == 1
+        if squeezed:
+            out = out.reshape(-1, 1)
+
+        # 使用中位數代替均值
+        median_vals = np.median(out, axis=0)
+
+        # 計算 MAD (Median Absolute Deviation)
+        mad_vals = np.median(np.abs(out - median_vals), axis=0)
+
+        # 轉換為標準差估計 (1.4826 是常態分佈下的轉換係數)
+        scale = 1.4826 * mad_vals
+        scale[scale < 1e-8] = 1.0
+
+        out = (out - median_vals) / scale
+
+        if clip_range is not None:
+            out = np.clip(out, clip_range[0], clip_range[1])
+
+        if squeezed:
+            out = out.squeeze(1)
+
+        return out
     @staticmethod
     # def minmax_normalize_columnwise(matrix):
     #     """
@@ -118,8 +198,9 @@ class StandardLossCalculator(BaseScoreCalculator):
 
 class RankWeightedLossCalculator(BaseScoreCalculator):
     """計算 Rank-based Weighted Loss"""
-    def __init__(self, theta=3.0):
+    def __init__(self, theta=3.0, file_prefix='aapd_mltc'):
         self.theta = theta
+        self._file_prefix = file_prefix
     
     def _calculate_rank_weight(self, logits):
         B, C = logits.shape
@@ -154,8 +235,16 @@ class RankWeightedLossCalculator(BaseScoreCalculator):
                 loss = F.binary_cross_entropy_with_logits(logits, b_labels.float(), reduction='none')
                 
                 weights = self._calculate_rank_weight(logits=logits)
-          
-                weighted_loss = torch.clamp(loss * weights, max=self.theta)
+
+                # [Fix 1] 對齊 paper Eq (7)：E_i,j = W × L，乘積不再 clamp。
+                # 原版的外層 clamp 會把雜訊樣本最強的 ~1.2% 訊號壓到 θ，
+                # 導致 GMM「雜訊群」mean 卡在 θ=3，無法跟乾淨群拉開。
+                # W 本身的 clamp 仍保留在 _calculate_rank_weight (Eq 6)。
+                #
+                # ── 原版（保留以便回退）─────────────────────────────────
+                # weighted_loss = torch.clamp(loss * weights, max=self.theta)
+                # ───────────────────────────────────────────────────────
+                weighted_loss = loss * weights
 
                 scores.append(weighted_loss.cpu().numpy()) 
                 
@@ -174,7 +263,7 @@ class RankWeightedLossCalculator(BaseScoreCalculator):
         
         logits_np = np.vstack(all_logits)
         logss_np = np.vstack(all_losses)  # 現在這裡不會報錯了，因為裡面有資料
-        save_logits(logits_np, labels_np, indices_np,logss_np, filename=f"rank_weighted_logits.npz")
+        save_logits(logits_np, labels_np, indices_np,logss_np, filename=f"rank_weighted_logits_{self._file_prefix}.npz")
         print(f"Debug Calculator Output:")
         print(f"  - Scores shape: {scores_np.shape}") # matric(54840, 54)
         print(f"  - Indices shape: {indices_np.shape}") #  (54840,)
@@ -292,7 +381,7 @@ class PrototypeDistanceCalculator(BaseScoreCalculator):
                     sim = F.cosine_similarity(feat_l, proto_l.unsqueeze(0).expand(B, -1), dim=1, eps=1e-8)
                     
                     # 論文邏輯: -cos，且限制在 0 到 -1
-                    dist[:, l] = -1.0 * torch.clamp(sim, min=0.0, max=1.0)
+                    dist[:, l] = -1.0 * torch.clamp(sim, min=-1.0, max=1.0)
 
         else:
             # ─── Mltc (CLS): [B, H] ───
@@ -308,7 +397,7 @@ class PrototypeDistanceCalculator(BaseScoreCalculator):
             sim = F.cosine_similarity(features.unsqueeze(1), protos_tensor.unsqueeze(0), dim=2, eps=1e-8)
             
             # 限制範圍並取負號
-            dist = -1.0 * torch.clamp(sim, min=0.0, max=1.0)
+            dist = -1.0 * torch.clamp(sim, min=-1.0, max=1.0)
 
             # Handle empty prototypes: 沒有原型的類別距離設為 0
             has_proto = (protos_tensor.abs().sum(dim=1) > 0).float().unsqueeze(0)
@@ -339,6 +428,8 @@ class PrototypeDistanceCalculator(BaseScoreCalculator):
                 # ─── 關鍵翻轉邏輯 ───
                 # lab=1 (正類): dist * (1)  -> 範圍 [-1, 0] (TP 靠近 -1, FP 靠近 0)
                 # lab=0 (負類): dist * (-1) -> 範圍 [0, 1]  (TN 靠近 0, FN 靠近 1)
+                # 註：雖然不在 paper Eq (10) 裡，但這是為了讓負樣本側
+                # GMM 的「argmin=clean」convention 也能成立的工程處理。
                 masked_dists = dist_np * (2 * lab_np - 1)
 
                 scores.append(masked_dists)
@@ -346,54 +437,872 @@ class PrototypeDistanceCalculator(BaseScoreCalculator):
                 labels.append(lab_np)
 
         return np.array(indices), np.vstack(scores), np.vstack(labels)
+class PositiveGapCalculator(BaseScoreCalculator):
+    """
+    計算 Positive Gap Score（方案 A）
+
+    定義：margin[b, c] = max(logits[b, :]) - logits[b, c]
+        - margin 大 → logit[c] 遠低於最高分 label → 模型不看好此 label
+        - margin 小 → logit[c] 接近最高分 → 模型幾乎也認為此 label = 1
+
+    Sign convention（與 CD 一致）：
+        masked_margin = margin * (2 * lab - 1)
+        - lab=1（正樣本）：margin 大 → score 高 → FP 嫌疑高
+        - lab=0（負樣本）：margin 小 → 翻轉後 score 高 → FN 嫌疑高
+    """
+
+    def calculate(self, model, dataloader, device):
+        model.eval()
+        scores = []
+        indices = []
+        labels = []
+
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Calculating Positive Gap"):
+                b_input_ids = batch['input_ids'].to(device)
+                b_attn_mask = batch['attention_mask'].to(device)
+                b_labels = batch['labels'].to(device)
+                b_idx = batch['index']
+
+                logits, _ = model(input_ids=b_input_ids, attention_mask=b_attn_mask)
+
+                # margin[b, c] = max(logits[b, :]) - logits[b, c]
+                max_logit = logits.max(dim=1, keepdim=True).values  # [B, 1]
+                margin = max_logit - logits                          # [B, C]
+
+                lab_np = b_labels.cpu().numpy()
+                margin_np = margin.cpu().numpy()
+
+                # lab=1: margin 大 = FP 嫌疑高（保留正號）
+                # lab=0: margin 小 = FN 嫌疑高（翻轉負號）
+                masked_margin = margin_np * (2 * lab_np - 1)
+
+                scores.append(masked_margin)
+                indices.extend(b_idx.numpy())
+                labels.append(lab_np)
+
+        indices_np = np.array(indices)
+        scores_np = np.vstack(scores)
+        labels_np = np.vstack(labels)
+        print(f"[PositiveGapCalculator] Scores shape: {scores_np.shape}")
+        return indices_np, scores_np, labels_np
+
+
 class HSMHybridPipeline:
     """
     專門處理 HSM 這種需要結合兩種分數的複雜流程
     這是一個更高階的 Orchestrator
     """
-    def __init__(self, rel_calculator, cd_calculator, alpha=0.5):
+    def __init__(self, rel_calculator, cd_calculator, alpha=0.5,
+                 gap_calculator=None, beta=1.0):
         self.rel_calc = rel_calculator
         self.cd_calc = cd_calculator
-        
+        self.gap_calc = gap_calculator
+
         self.alpha = alpha
+        # beta: CD 在 (1-alpha) 部分的佔比
+        # beta=1.0 → 純 CD（無 margin，退化為原始 HSM）
+        # beta=0.0 → 純 Margin（無 CD）
+        self.beta = beta
 
 
 
 
-    def run_score_only(self, model, dataloader, device, encoder_name='mltc'):
-        """只計算並融合分數，不進行篩選/校正 (為了外部參數搜尋用)"""
-        print("🚀 Pipeline: Calculating Scores Only...")
+    def run_score_only(self, model, dataloader, device, encoder_name='mltc',
+                       normalization='minmax', clip_range=None, dataset_name='aapd'):
+        """
+        只計算並融合分數，不進行篩選/校正 (為了外部參數搜尋用)
 
-        # 1. 計算
+        Args:
+            model: 訓練好的模型
+            dataloader: 數據加載器
+            device: 運算設備
+            encoder_name: 編碼器名稱 (用於檔案命名)
+            normalization: 標準化方法 'minmax' | 'zscore' | 'robust_zscore'
+            clip_range: z-score 的裁剪範圍，例如 (-5, 5)，僅在 zscore 模式下有效
+        """
+        print("Pipeline: Calculating Scores Only...")
+
+        # 1. 計算原始分數
         idx1, rel_scores, labels = self.rel_calc.calculate(model, dataloader, device)
         idx_c, cd_scores, labels = self.cd_calc.calculate(model, dataloader, device)
 
-        # 2. 歸一化
-        rel_norm = MathUtils.minmax_normalize_columnwise(rel_scores)
-        cd_norm = MathUtils.minmax_normalize_columnwise(cd_scores)
+        # 1b. 若有 gap calculator，也一起計算
+        if self.gap_calc is not None:
+            idx_m, margin_scores, _ = self.gap_calc.calculate(model, dataloader, device)
 
-        # 根據 encoder 名稱保存不同的文件
-        save_path = f"data/evaluation_results_{encoder_name}.npz"
+        # 2. 根據選擇的方法進行標準化
+        def _normalize(arr):
+            if normalization == 'zscore':
+                return MathUtils.zscore_normalize_columnwise(arr, clip_range=clip_range)
+            elif normalization == 'robust_zscore':
+                return MathUtils.robust_zscore_normalize_columnwise(arr, clip_range=clip_range)
+            elif normalization == 'minmax':
+                return MathUtils.minmax_normalize_columnwise(arr)
+            else:
+                raise ValueError(f"Unknown normalization method: {normalization}")
 
-        # 使用 np.savez_compressed 來打包儲存多個陣列
-        np.savez_compressed(
-            save_path,
-            idx_rel=idx1,           # 將 idx1 存為名稱 'idx_rel'
-            rel_scores=rel_scores,  # 將 rel_scores 存為名稱 'rel_scores'
-            idx_cd=idx_c,           # 將 idx_c 存為名稱 'idx_cd'
-            cd_scores=cd_scores,    # 將 cd_scores 存為名稱 'cd_scores'
-            labels=labels      # 由於兩個 labels 通常是一樣的 ground truth，存一個代表即可
+        rel_norm = _normalize(rel_scores)
+        cd_norm = _normalize(cd_scores)
+        print(f"  Normalization: {normalization} (clip_range={clip_range})")
+
+        # 3. 儲存中間結果
+        suffix = f"_{normalization}" if normalization != 'minmax' else ""
+        save_path = f"data/evaluation_results_{dataset_name}_{encoder_name}{suffix}.npz"
+
+        save_kwargs = dict(
+            idx_rel=idx1,
+            rel_scores=rel_scores,
+            rel_norm=rel_norm,
+            idx_cd=idx_c,
+            cd_scores=cd_scores,
+            cd_norm=cd_norm,
+            labels=labels,
+            normalization=normalization,
+            alpha=self.alpha,
+            beta=self.beta,
         )
+        if self.gap_calc is not None:
+            margin_norm = _normalize(margin_scores)
+            save_kwargs['margin_scores'] = margin_scores
+            save_kwargs['margin_norm'] = margin_norm
 
-        print(f"太棒了！所有預測結果與標籤已成功壓縮並儲存至：{save_path}")
-        
-                # 3. 融合
-        hsm_scores = rel_norm * self.alpha + cd_norm * (1 - self.alpha)
-        
-        # 回傳分數，讓外部迴圈去決定怎麼切
+        np.savez_compressed(save_path, **save_kwargs)
+        print(f"  Scores saved to: {save_path}")
+
+        # 4. 融合
+        # HSM = alpha * REL + (1-alpha) * (beta * CD + (1-beta) * Margin)
+        if self.gap_calc is not None:
+            cd_part = self.beta * cd_norm + (1 - self.beta) * margin_norm
+            print(f"  Fusion: alpha={self.alpha}, beta={self.beta} (REL + CD + Positive Gap)")
+        else:
+            cd_part = cd_norm
+            print(f"  Fusion: alpha={self.alpha} (REL + CD, no Positive Gap)")
+
+        hsm_scores = self.alpha * rel_norm + (1 - self.alpha) * cd_part
+
         return hsm_scores, labels, idx1
 
-  
+    def run_score_separately(self, model, dataloader, device, encoder_name='mltc',
+                             normalization='minmax', clip_range=None, dataset_name='aapd'):
+        """
+        計算並分別回傳各項原始分數（不融合），供兩階段校正器使用。
+
+        Returns:
+            rel_norm:  [N, C] 標準化 REL 分數
+            cd_norm:   [N, C] 標準化 CD 分數
+            gap_norm:  [N, C] 標準化 Positive Gap 分數
+            labels:    [N, C] 原始標籤
+            indices:   [N]    樣本索引
+        """
+        if self.gap_calc is None:
+            raise ValueError("run_score_separately 需要 gap_calculator，請在初始化時傳入。")
+
+        print("Pipeline: Calculating Scores Separately (for TwoStage)...")
+
+        idx1, rel_scores, labels = self.rel_calc.calculate(model, dataloader, device)
+        idx_c, cd_scores, _      = self.cd_calc.calculate(model, dataloader, device)
+        idx_m, gap_scores, _     = self.gap_calc.calculate(model, dataloader, device)
+
+        def _normalize(arr):
+            if normalization == 'zscore':
+                return MathUtils.zscore_normalize_columnwise(arr, clip_range=clip_range)
+            elif normalization == 'robust_zscore':
+                return MathUtils.robust_zscore_normalize_columnwise(arr, clip_range=clip_range)
+            elif normalization == 'minmax':
+                return MathUtils.minmax_normalize_columnwise(arr)
+            else:
+                raise ValueError(f"Unknown normalization method: {normalization}")
+
+        rel_norm = _normalize(rel_scores)
+        cd_norm  = _normalize(cd_scores)
+        gap_norm = _normalize(gap_scores)
+
+        print(f"  [run_score_separately] rel:{rel_scores.shape}, cd:{cd_scores.shape}, gap:{gap_scores.shape}")
+        # 回傳 raw scores 供 TwoStage 使用（保留原始 scale，不壓縮）
+        # 同時回傳 norm 供外部推導 hsm_scores 使用
+        return rel_scores, cd_scores, gap_scores, rel_norm, cd_norm, gap_norm, labels, idx1
+
+
+class RELOnlyCorrector:
+    """
+    Stage 1 only: 對每個 label，取 label=1 樣本中 REL 最高的 top_ratio 直接翻轉為 0。
+    作為 TwoStageRELFPCorrector 的基線，衡量 Stage 1 單獨效果。
+    """
+
+    def __init__(self, top_ratio: float = 0.01):
+        self.top_ratio = top_ratio
+
+    def correct(self, rel_scores: np.ndarray, labels: np.ndarray, **kwargs) -> np.ndarray:
+        rel    = np.asarray(rel_scores, dtype=float)
+        labels = np.asarray(labels, dtype=int)
+        N, C   = labels.shape
+        corrected = labels.astype(float).copy()
+
+        total_flipped = 0
+        for c in range(C):
+            pos_indices = np.where(labels[:, c] == 1)[0]
+            if len(pos_indices) < 4:
+                continue
+            top_k = max(1, int(len(pos_indices) * self.top_ratio))
+            local_top    = np.argsort(rel[pos_indices, c])[-top_k:]
+            cand_indices = pos_indices[local_top]
+            corrected[cand_indices, c] = 0.0
+            total_flipped += len(cand_indices)
+            logger.info(
+                f"  [RELOnly Label {c}] flipped={len(cand_indices)}"
+                f" ({len(cand_indices)/len(pos_indices):.1%} of positives)"
+            )
+
+        logger.info(f"[RELOnlyCorrector] Done. total_flipped={total_flipped}")
+        return corrected
+
+
+class TwoStageRELFPCorrector:
+    """
+    兩階段 FP 校正器（僅針對 label=1 的樣本）:
+
+    Stage 1 — REL 篩選 (per-label):
+        對每個 label c，取所有 label=1 樣本中 REL 分數最高的 top_ratio 作為 FP 候選池。
+        REL 高 → 模型對此 label 損失大 → 標記為 1 但模型不認同 → FP 嫌疑高。
+
+    Stage 2 — 2D GMM(CD, Gap):
+        對候選池以 (CD, Positive Gap) 兩個特徵 fit 2-component GMM。
+        CD 與 Gap 比 REL 更接近 Gaussian 分佈，更符合 GMM 前提假設。
+        以 epsilon-band 輸出校正後的標籤（soft label）。
+    """
+
+    def __init__(self, top_ratio: float = 0.05, epsilon: float = 0.05, n_components: int = 2,
+                 feature_mode: str = '2d'):
+        """
+        Args:
+            top_ratio:    Stage 1 REL top-N% 直接翻轉比例
+            epsilon:      epsilon-band 校正邊界
+            n_components: Stage 2 GMM 群數 (2..5)
+            feature_mode: Stage 2 GMM 特徵模式
+                '2d'  — 原始 2D (−CD, Gap) 聯合 GMM（預設）
+                'cd'  — 只用 −CD 做 1D GMM
+                'gap' — 只用 Positive Gap 做 1D GMM
+        """
+        self.top_ratio    = top_ratio
+        self.epsilon      = epsilon
+        self.n_components = n_components
+        self.feature_mode = feature_mode   # '2d' | 'cd' | 'gap'
+
+    # ─────────────────────────────────────────────────────────────
+    # 1D GMM helpers
+    # ─────────────────────────────────────────────────────────────
+
+    def _run_1d_gmm(self, scores_1d: np.ndarray) -> dict:
+        """
+        在 1D 分數上 fit n_components-GMM。
+        排序方式：mean 升序，idx=0 最小(clean)，idx=-1 最大(noisy)。
+        回傳與 _run_2d_gmm 相同格式的 prob_dict。
+        """
+        data = scores_1d.reshape(-1, 1)
+        gmm = GMM(n_components=self.n_components, max_iter=200, tol=1e-3,
+                  reg_covar=1e-4, random_state=0)
+        gmm.fit(data)
+
+        sorted_idx = np.argsort(gmm.means_.flatten())
+        probs_all  = gmm.predict_proba(data)
+
+        result = {
+            'clean_probs': probs_all[:, sorted_idx[0]],
+            'noisy_probs': probs_all[:, sorted_idx[-1]],
+        }
+        mid_indices = sorted_idx[1:-1]
+        if len(mid_indices) == 1:
+            result['mid_probs'] = probs_all[:, mid_indices[0]]
+        else:
+            for i, idx in enumerate(mid_indices):
+                result[f'mid_probs_{i}'] = probs_all[:, idx]
+        return result
+
+    def _fit_2d_gmm(self, cd_vals: np.ndarray, gap_vals: np.ndarray) -> np.ndarray:
+        """
+        在 (CD, Gap) 2D 空間 fit 2-component GMM。
+
+        CD masked for label=1 範圍 [-1, 0]：
+            TP → close to -1（靠近原型，cosine similarity 高）
+            FP → close to  0（遠離原型，cosine similarity 低）
+        取負號後 [0, 1]：數值越大 = FP 嫌疑越高，方向與 Gap 一致。
+
+        Gap masked for label=1 為正值：
+            TP → 小（模型對此 label 有把握）
+            FP → 大（模型更偏好其他 label）
+
+        Returns:
+            prob_clean: [n] 每個候選樣本屬於「乾淨 TP 群」的機率
+        """
+        x1 = cd_vals   # 翻轉 CD：大 = FP 嫌疑高（與 Gap 方向一致）
+        x2 =  gap_vals  # Gap：大 = FP 嫌疑高
+
+        # 不做 minmax：pipeline 已做過 normalize，
+        # GMM 假設 Gaussian 分佈，minmax 會破壞真實分佈形狀。
+        X = np.column_stack([x1, x2])    # [n, 2]
+
+        gmm = GMM(n_components=2, max_iter=200, tol=1e-3,
+                  reg_covar=1e-4, random_state=0)
+        gmm.fit(X)
+
+        # 均值範數較小的 component = clean（TP）群
+        mean_norms = np.linalg.norm(gmm.means_, axis=1)
+        clean_idx  = int(mean_norms.argmin())
+        prob_clean = gmm.predict_proba(X)[:, clean_idx]
+        return prob_clean
+
+    def _apply_epsilon_band(self, prob_clean: np.ndarray, epsilon: float) -> np.ndarray:
+        """
+        epsilon-band soft label:
+            prob_clean > 0.5 + ε  →  1.0（確定是 TP，保留）
+            prob_clean < 0.5 - ε  →  0.0（確定是 FP，翻轉）
+            中間帶               →  prob_clean（soft label，不確定）
+        """
+        prob_clean = np.nan_to_num(prob_clean, nan=0.5)
+        return np.where(prob_clean > 0.5 + epsilon, 1.0,
+               np.where(prob_clean < 0.5 - epsilon, 0.0,
+                        prob_clean))
+
+    def _run_2d_gmm(self, cd_vals: np.ndarray, gap_vals: np.ndarray) -> dict:
+        """
+        鏡像 LabelRefiner._run_gmm，但輸入是 2D (−CD, Gap) 特徵。
+        Component 依 mean norm 排序：idx=0 最小(clean)，idx=-1 最大(noisy)。
+        回傳與 LabelRefiner 相同格式的 prob_dict。
+        """
+        x1 = cd_vals   # 翻轉 CD，使 FP 嫌疑高 = 大值
+        x2 = gap_vals
+        X  = np.column_stack([x1, x2])   # [n, 2]
+
+        gmm = GMM(n_components=self.n_components, max_iter=200, tol=1e-3,
+                  reg_covar=1e-4, random_state=0)
+        gmm.fit(X)
+
+        # 排序：norm 小 = clean，norm 大 = noisy（同 LabelRefiner mean 排序）
+        sorted_idx  = np.argsort(np.linalg.norm(gmm.means_, axis=1))
+        probs_all   = gmm.predict_proba(X)
+
+        result = {
+            'clean_probs': probs_all[:, sorted_idx[0]],
+            'noisy_probs': probs_all[:, sorted_idx[-1]],
+        }
+        mid_indices = sorted_idx[1:-1]
+        if len(mid_indices) == 1:
+            result['mid_probs'] = probs_all[:, mid_indices[0]]
+        else:
+            for i, idx in enumerate(mid_indices):
+                result[f'mid_probs_{i}'] = probs_all[:, idx]
+        return result
+
+    def _apply_2d_correction_logic(self, prob_dict: dict, epsilon: float) -> np.ndarray:
+        """
+        鏡像 LabelRefiner._apply_correction_logic，Stage2 候選池全為 label=1 (FP context)。
+        target_y=1.0 固定（Stage2 候選都是 positive samples）。
+        2-comp : epsilon-band（同原本 _apply_epsilon_band）
+        3-comp : argmax → clean=1.0 / mid=0.5 / noisy=0.0
+        4-comp : gradient → clean=1.0 / mid-clean=0.7 / mid-noisy=0.3 / noisy=0.0
+        5-comp : gradient → 1.0 / 0.75 / 0.5 / 0.25 / 0.0
+        """
+        n = self.n_components
+        if n == 2:
+            probs = np.nan_to_num(prob_dict['clean_probs'], nan=0.5)
+            return np.where(probs > 0.5 + epsilon, 1.0,
+                   np.where(probs < 0.5 - epsilon, 0.0,
+                            probs))
+
+        # 3+ comp：組成 stack，取 argmax 後對應 gradient 值
+        if n == 3:
+            stack = np.vstack([prob_dict['clean_probs'],
+                               prob_dict['mid_probs'],
+                               prob_dict['noisy_probs']])
+            gradient = [1.0, 0.5, 0.0]
+        elif n == 4:
+            stack = np.vstack([prob_dict['clean_probs'],
+                               prob_dict['mid_probs_0'],
+                               prob_dict['mid_probs_1'],
+                               prob_dict['noisy_probs']])
+            gradient = [1.0, 0.7, 0.3, 0.0]
+        else:  # 5
+            stack = np.vstack([prob_dict['clean_probs'],
+                               prob_dict['mid_probs_0'],
+                               prob_dict['mid_probs_1'],
+                               prob_dict['mid_probs_2'],
+                               prob_dict['noisy_probs']])
+            gradient = [1.0, 0.75, 0.5, 0.25, 0.0]
+
+        winners = np.argmax(stack, axis=0)
+        out = np.zeros(len(winners), dtype=float)
+        for i, val in enumerate(gradient):
+            out[winners == i] = val
+        return out
+
+    def correct(self, rel_scores: np.ndarray, cd_scores: np.ndarray,
+                gap_scores: np.ndarray, labels: np.ndarray,
+                args, y_true: np.ndarray = None) -> np.ndarray:
+        """
+        Args:
+            rel_scores: [N, C] 標準化 REL 分數（值越大代表 FP 嫌疑越高）
+            cd_scores:  [N, C] 標準化 CD 分數（masked，label=1 → 值在 [-1, 0]）
+            gap_scores: [N, C] 標準化 Gap 分數（masked，label=1 → 正值）
+            labels:     [N, C] 原始 noisy 標籤（0 or 1）
+            args:       含 args.epsilon
+            y_true:     [N, C] 真實標籤（可選，用於視覺化 TP/FP overlap）
+        Returns:
+            corrected:  [N, C] float 校正後標籤
+        """
+        rel    = np.asarray(rel_scores, dtype=float)
+        cd     = np.asarray(cd_scores,  dtype=float)
+        gap    = np.asarray(gap_scores, dtype=float)
+        labels = np.asarray(labels,     dtype=int)
+
+        N, C      = labels.shape
+        corrected = labels.astype(float).copy()
+        epsilon   = getattr(args, 'epsilon', self.epsilon)
+
+        total_candidates = 0
+        total_flipped    = 0
+        total_soft       = 0
+
+        for c in range(C):
+            pos_indices = np.where(labels[:, c] == 1)[0]   # 全局 row index
+
+            if len(pos_indices) < 4:
+                continue
+
+            # ── Stage 1: REL top-N% 直接翻轉 ─────────────────────────
+            rel_c = rel[pos_indices, c]
+            top_k = int(len(pos_indices) * self.top_ratio)
+
+            if top_k == 0:
+                continue
+
+            # argsort 升序，取最後 top_k 個（REL 最高 = 最可疑）
+            local_top    = np.argsort(rel_c)[-top_k:]
+            cand_indices = pos_indices[local_top]    # 全局 index
+
+            # 直接翻轉：1-label（FP:1→0, FN:0→1，方向自動正確）
+            corrected[cand_indices, c] = 1.0 - labels[cand_indices, c]
+            total_flipped += len(cand_indices)
+
+            logger.info(
+                f"  [TwoStage Label {c}] Stage1 flipped={len(cand_indices)}"
+            )
+
+            # ── Stage 2: 剩下 95% → 2D GMM(CD, Gap) ─────────────────
+            local_rest    = np.argsort(rel_c)[:-top_k]   # REL 較低的其餘樣本
+            rest_indices  = pos_indices[local_rest]
+
+            if len(rest_indices) < 4:   # GMM 需要至少 4 個點
+                continue
+
+            total_candidates += len(rest_indices)
+
+            cd_c  = cd[rest_indices, c]
+            gap_c = gap[rest_indices, c]
+            true_c = y_true[rest_indices, c] if y_true is not None else None
+
+            # 記錄候選池 FP 混入率
+            if true_c is not None:
+                n_fp_in_pool = int((true_c == 0).sum())
+                n_tp_in_pool = int((true_c == 1).sum())
+                fp_ratio = n_fp_in_pool / len(true_c) if len(true_c) > 0 else 0.0
+                logger.info(
+                    f"  [TwoStage Label {c}] Stage2 候選池 FP 混入率: "
+                    f"{n_fp_in_pool}/{len(true_c)} ({fp_ratio:.1%})  "
+                    f"TP={n_tp_in_pool}, FP={n_fp_in_pool}"
+                )
+
+            target_list      = getattr(args, 'targert_list', [])
+            save_dir_stage2  = getattr(args, 'Resutl_dir', 'gmm_debug_plots') + '/twostage_plots'
+            label_index_path = getattr(args, 'label_index_path', None)
+            enc_name         = getattr(args, 'encoder_name', '')
+
+            try:
+                mode = self.feature_mode  # '2d' | 'cd' | 'gap'
+
+                if mode == '2d':
+                    # ── 原始 2D (−CD, Gap) GMM ──────────────────────────────
+                    if self.n_components == 2:
+                        prob_clean = self._fit_2d_gmm(cd_c, gap_c)
+                        new_labels = self._apply_epsilon_band(prob_clean, epsilon)
+                        if c in target_list:
+                            visualize_2d_gmm_candidates(
+                                cd_vals=cd_c, gap_vals=gap_c, prob_clean=prob_clean,
+                                label_index=c, save_dir=save_dir_stage2,
+                                label_index_path=label_index_path,
+                                encoder_name=enc_name, true_labels=true_c,
+                            )
+                    else:
+                        prob_dict  = self._run_2d_gmm(cd_c, gap_c)
+                        new_labels = self._apply_2d_correction_logic(prob_dict, epsilon)
+
+                    # 群數純度分析（k=2..5）：target_list 且有 true_c 時觸發
+                    if c in target_list and true_c is not None:
+                        visualize_gmm_cluster_purity_k(
+                            cd_vals=cd_c, gap_vals=gap_c, true_labels=true_c,
+                            label_index=c, k_values=(2, 3, 4, 5),
+                            save_dir=save_dir_stage2,
+                            label_index_path=label_index_path,
+                            encoder_name=enc_name,
+                        )
+
+                elif mode in ('cd', 'gap'):
+                    # ── 1D GMM：只用單一特徵 ────────────────────────────────
+                    # 'cd'  → -CD（翻轉後大值 = FP 嫌疑高）
+                    # 'gap' → Positive Gap（大值 = FP 嫌疑高）
+                    scores_1d  = -cd_c if mode == 'cd' else gap_c
+                    prob_dict  = self._run_1d_gmm(scores_1d)
+                    new_labels = self._apply_2d_correction_logic(prob_dict, epsilon)
+
+                    if c in target_list and true_c is not None:
+                        visualize_1d_gmm_features(
+                            cd_vals=cd_c, gap_vals=gap_c, true_labels=true_c,
+                            label_index=c, n_components=self.n_components,
+                            save_dir=save_dir_stage2,
+                            label_index_path=label_index_path,
+                            encoder_name=f"{enc_name}_{mode}",
+                        )
+
+                else:
+                    raise ValueError(
+                        f"Unknown feature_mode='{mode}'. Choose '2d', 'cd', or 'gap'."
+                    )
+
+            except Exception as e:
+                logger.warning(
+                    f"  [TwoStage Label {c}] Stage2 GMM"
+                    f"(n={self.n_components}, mode={self.feature_mode}) failed: {e}, skipping."
+                )
+                continue
+
+            corrected[rest_indices, c] = new_labels
+
+            soft = int(np.sum((new_labels > 0.0) & (new_labels < 1.0)))
+            gmm_flipped = int(np.sum(new_labels == 0.0))
+            total_soft += soft
+            total_flipped += gmm_flipped
+
+            logger.info(
+                f"  [TwoStage Label {c}] Stage2 candidates={len(rest_indices)}, "
+                f"flipped={gmm_flipped}, soft={soft}"
+            )
+
+        logger.info(
+            f"[TwoStageRELFPCorrector] Done. "
+            f"stage2_candidates={total_candidates}, flipped={total_flipped}, soft={total_soft}"
+        )
+        return corrected
+
+
+class FrequencyAware1DGMMCorrector:
+    """
+    頻率感知 1D GMM 校正器（FP 導向）
+
+    頻率組（head/middle/tail）作為基準，但融合策略由資料驅動決定：
+        先計算每個標籤正樣本的 CD–Gap Pearson 相關係數，依此選策略：
+            corr > CORR_HIGH (0.6)           → mean  (兩信號一致，平均降噪)
+            corr < CORR_LOW  (0.3)           → max   (兩信號不一致，取保守上界)
+            pos_count < MIN_CD_SAMPLES (100) → gap   (CD 原型估計不穩)
+            其餘依頻率組預設                  → head=max, middle=mean, tail=gap
+
+    主要方法：
+        analyze()             — 輸出每個標籤的 CD/Gap 統計 + 自動建議策略（DataFrame）
+        correct()             — 一次性依資料驅動 epsilon-band 校正所有正樣本
+        progressive_correct() — 按可疑分數降序逐步翻轉，每輪回報 FP Recall
+    """
+
+    HEAD_THRESH    = 4500
+    MID_THRESH     = 2000
+    CORR_HIGH      = 0.6   # above → mean (signals agree)
+    CORR_LOW       = 0.3   # below → max  (signals diverge)
+    MIN_CD_SAMPLES = 100   # below → gap  (CD prototype unreliable)
+
+    def __init__(self,
+                 n_components: int   = 2,
+                 head_epsilon: float = 0.03,
+                 mid_epsilon:  float = 0.05,
+                 tail_epsilon: float = 0.10):
+        self.n_components = n_components
+        self.head_epsilon = head_epsilon
+        self.mid_epsilon  = mid_epsilon
+        self.tail_epsilon = tail_epsilon
+
+    # ── 1. 標籤頻率分組 ─────────────────────────────────────────────
+
+    def _classify_labels(self, labels: np.ndarray) -> tuple:
+        """
+        Returns:
+            freq_group : dict  {c → 'head' | 'middle' | 'tail'}
+            pos_counts : [C]   每個標籤的正樣本絕對數
+        """
+        pos_counts = labels.sum(axis=0).astype(int)
+        freq_group = {}
+        for c, cnt in enumerate(pos_counts):
+            if cnt >= self.HEAD_THRESH:
+                freq_group[c] = 'head'
+            elif cnt >= self.MID_THRESH:
+                freq_group[c] = 'middle'
+            else:
+                freq_group[c] = 'tail'
+        return freq_group, pos_counts
+
+    # ── 2. 1D GMM → noisy 後驗概率 ──────────────────────────────────
+
+    def _1d_noisy_prob(self, scores_1d: np.ndarray) -> np.ndarray:
+        """
+        Mean 最大的 component = noisy（FP 嫌疑最高），回傳其後驗概率。
+        若樣本數 < 4 回傳全零。
+        """
+        n = len(scores_1d)
+        if n < 4:
+            return np.zeros(n)
+        try:
+            gmm = GMM(n_components=self.n_components, max_iter=200,
+                      tol=1e-3, reg_covar=1e-4, random_state=0)
+            gmm.fit(scores_1d.reshape(-1, 1))
+        except Exception:
+            return np.zeros(n)
+        noisy_idx = int(np.argmax(gmm.means_.flatten()))
+        return gmm.predict_proba(scores_1d.reshape(-1, 1))[:, noisy_idx]
+
+    # ── 3. 資料驅動策略選擇 ─────────────────────────────────────────
+
+    def _select_strategy(self, group: str, corr: float, pos_count: int) -> str:
+        """
+        依 CD–Gap Pearson 相關係數 + 正樣本數決定融合策略。
+        回傳 'max' | 'mean' | 'gap'
+        """
+        if pos_count < self.MIN_CD_SAMPLES or group == 'tail':
+            return 'gap'
+        if corr > self.CORR_HIGH:
+            return 'mean'
+        if corr < self.CORR_LOW:
+            return 'max'
+        return 'max' if group == 'head' else 'mean'
+
+    # ── 4. 分布分析 + 策略報告 ──────────────────────────────────────
+
+    def analyze(self,
+                cd_scores:  np.ndarray,
+                gap_scores: np.ndarray,
+                labels:     np.ndarray,
+                save_path:  str = None) -> 'pd.DataFrame':
+        """
+        對每個標籤計算正樣本的 CD/Gap 分布統計與 Pearson 相關係數，
+        輸出自動選擇的融合策略供人工審閱。
+
+        Args:
+            save_path: 若傳入，將 DataFrame 存為 CSV（e.g. 'result_dir/fa1dgmm_analyze.csv'）
+
+        Returns:
+            DataFrame columns:
+                label, freq_group, pos_count,
+                cd_mean, cd_std, gap_mean, gap_std,
+                cd_gap_corr, strategy
+        """
+        import pandas as pd
+        freq_group, _ = self._classify_labels(labels)
+        records = []
+        for c in range(labels.shape[1]):
+            pos_idx = np.where(labels[:, c] == 1)[0]
+            n = len(pos_idx)
+            if n < 4:
+                records.append({
+                    'label': c, 'freq_group': freq_group[c], 'pos_count': n,
+                    'cd_mean': np.nan, 'cd_std': np.nan,
+                    'gap_mean': np.nan, 'gap_std': np.nan,
+                    'cd_gap_corr': np.nan, 'strategy': 'skip',
+                })
+                continue
+            cd_c  = cd_scores[pos_idx, c]
+            gap_c = gap_scores[pos_idx, c]
+            corr  = float(np.corrcoef(cd_c, gap_c)[0, 1])
+            if not np.isfinite(corr):
+                corr = 0.0
+            strategy = self._select_strategy(freq_group[c], corr, n)
+            records.append({
+                'label':       c,
+                'freq_group':  freq_group[c],
+                'pos_count':   n,
+                'cd_mean':     round(float(cd_c.mean()), 4),
+                'cd_std':      round(float(cd_c.std()),  4),
+                'gap_mean':    round(float(gap_c.mean()), 4),
+                'gap_std':     round(float(gap_c.std()),  4),
+                'cd_gap_corr': round(corr, 4),
+                'strategy':    strategy,
+            })
+        df = pd.DataFrame(records)
+        logger.info(
+            "[FA1DGMM.analyze] strategy distribution:\n"
+            + df.groupby('strategy')['label'].count().to_string()
+        )
+        if save_path:
+            df.to_csv(save_path, index=False)
+            logger.info(f"[FA1DGMM.analyze] saved → {save_path}")
+        return df
+
+    # ── 5. 計算可疑分數矩陣（資料驅動策略）────────────────────────
+
+    def compute_suspicion(self,
+                          cd_scores:  np.ndarray,
+                          gap_scores: np.ndarray,
+                          labels:     np.ndarray) -> np.ndarray:
+        """
+        Returns:
+            suspicion : [N, C]，僅 label=1 的位置有值，其餘為 0
+        """
+        N, C = labels.shape
+        freq_group, _ = self._classify_labels(labels)
+        suspicion = np.zeros((N, C), dtype=float)
+
+        for c in range(C):
+            pos_idx = np.where(labels[:, c] == 1)[0]
+            n = len(pos_idx)
+            if n < 4:
+                continue
+
+            cd_c  = cd_scores[pos_idx, c]
+            gap_c = gap_scores[pos_idx, c]
+            corr  = float(np.corrcoef(cd_c, gap_c)[0, 1])
+            if not np.isfinite(corr):
+                corr = 0.0
+
+            strategy  = self._select_strategy(freq_group[c], corr, n)
+            cd_noisy  = self._1d_noisy_prob(cd_c)
+            gap_noisy = self._1d_noisy_prob(gap_c)
+
+            if strategy == 'max':
+                combined = np.maximum(cd_noisy, gap_noisy)
+            elif strategy == 'mean':
+                combined = (cd_noisy + gap_noisy) / 2.0
+            else:  # 'gap'
+                combined = gap_noisy
+
+            logger.debug(
+                f"  [FA1DGMM c={c:>2} | {freq_group[c]:6} | corr={corr:+.3f}] "
+                f"strategy={strategy}"
+            )
+            suspicion[pos_idx, c] = combined
+
+        return suspicion
+
+    # ── 6. Epsilon-band（noisy prob 方向）───────────────────────────
+
+    def _apply_epsilon_band(self, prob_noisy: np.ndarray, epsilon: float) -> np.ndarray:
+        """
+        prob_noisy > 0.5 + ε → 0.0  (確定 FP，翻轉)
+        prob_noisy < 0.5 - ε → 1.0  (確定 TP，保留)
+        中間帶               → 1 - prob_noisy  (soft label)
+        """
+        p = np.nan_to_num(prob_noisy, nan=0.5)
+        return np.where(p > 0.5 + epsilon, 0.0,
+               np.where(p < 0.5 - epsilon, 1.0,
+                        1.0 - p))
+
+    # ── 7. 一次性全局校正 ────────────────────────────────────────────
+
+    def correct(self,
+                cd_scores:  np.ndarray,
+                gap_scores: np.ndarray,
+                labels:     np.ndarray) -> np.ndarray:
+        """
+        依資料驅動 epsilon-band 直接校正所有正樣本。
+        Returns: corrected [N, C] float
+        """
+        freq_group, _ = self._classify_labels(labels)
+        suspicion     = self.compute_suspicion(cd_scores, gap_scores, labels)
+        corrected     = labels.astype(float).copy()
+        eps_map       = {'head': self.head_epsilon,
+                         'middle': self.mid_epsilon,
+                         'tail':   self.tail_epsilon}
+
+        for c in range(labels.shape[1]):
+            pos_idx = np.where(labels[:, c] == 1)[0]
+            if len(pos_idx) < 4:
+                continue
+            eps     = eps_map[freq_group[c]]
+            new_lab = self._apply_epsilon_band(suspicion[pos_idx, c], eps)
+            corrected[pos_idx, c] = new_lab
+            flipped = int((new_lab == 0.0).sum())
+            soft    = int(((new_lab > 0.0) & (new_lab < 1.0)).sum())
+            logger.info(
+                f"  [FA1DGMM c={c:>2} | {freq_group[c]:6}] "
+                f"pos={len(pos_idx)}, flipped={flipped}, soft={soft}, eps={eps}"
+            )
+
+        return corrected
+
+    # ── 6. 逐步校正 + FP Recall 追蹤 ───────────────────────────────
+
+    def progressive_correct(self,
+                            cd_scores:  np.ndarray,
+                            gap_scores: np.ndarray,
+                            labels:     np.ndarray,
+                            y_true:     np.ndarray,
+                            n_rounds:   int = 10) -> tuple:
+        """
+        按可疑分數降序逐步翻轉，每輪評估 FP Recall。
+
+        Args:
+            cd_scores, gap_scores : [N, C] 已歸一化分數（masked sign convention）
+            labels   : [N, C] noisy 標籤 (0/1)
+            y_true   : [N, C] 真實標籤 (0/1)
+            n_rounds : 分幾輪校正
+
+        Returns:
+            corrected   : [N, C] float，最終校正後標籤
+            round_stats : list[dict]  每輪統計
+        """
+        suspicion = self.compute_suspicion(cd_scores, gap_scores, labels)
+
+        pos_rows, pos_cols = np.where(labels == 1)
+        sorted_order = np.argsort(-suspicion[pos_rows, pos_cols])
+        s_rows = pos_rows[sorted_order]
+        s_cols = pos_cols[sorted_order]
+
+        n_pos    = len(s_rows)
+        batch_sz = max(1, n_pos // n_rounds)
+
+        corrected    = labels.astype(float).copy()
+        fp_mask      = (y_true == 0) & (labels == 1)
+        total_fp     = int(fp_mask.sum())
+        round_stats  = []
+
+        for r in range(n_rounds):
+            start = r * batch_sz
+            end   = (r + 1) * batch_sz if r < n_rounds - 1 else n_pos
+            corrected[s_rows[start:end], s_cols[start:end]] = 0.0
+
+            corrected_bin   = (corrected >= 0.5).astype(int)
+            fix_fp          = int(((corrected_bin == 0) & fp_mask).sum())
+            miss_fp         = int(((corrected_bin == 1) & fp_mask).sum())
+            fp_recall       = fix_fp / total_fp if total_fp > 0 else 0.0
+
+            flipped_mask                         = np.zeros_like(corrected, dtype=bool)
+            flipped_mask[s_rows[:end], s_cols[:end]] = True
+            fp_precision = int((flipped_mask & fp_mask).sum()) / end if end > 0 else 0.0
+
+            round_stats.append({
+                'round':              r + 1,
+                'cumulative_flipped': end,
+                'flip_ratio':         end / n_pos,
+                'fix_fp':             fix_fp,
+                'miss_fp':            miss_fp,
+                'total_fp':           total_fp,
+                'fp_recall':          fp_recall,
+                'fp_precision':       fp_precision,
+            })
+
+            logger.info(
+                f"  [Progressive {r+1:>2}/{n_rounds}] "
+                f"flipped={end}/{n_pos} ({end/n_pos:.1%})  "
+                f"Fix_FP={fix_fp}  Miss_FP={miss_fp}  "
+                f"FP_Recall={fp_recall:.3f}  FP_Prec={fp_precision:.3f}"
+            )
+
+        return corrected, round_stats
+
+
 class GMMNoiseFilter(BaseNoiseFilter):
     """使用 GMM 二分法進行篩選"""
     def __init__(self, n_components=2, threshold=0.5):
@@ -471,75 +1380,8 @@ class GMMNoiseFilter(BaseNoiseFilter):
         # 回傳 "屬於乾淨群" 的機率
         return probs_all[:, clean_comp_idx]
     
-    # def _apply_band_correction_analyzed(probs, y_noisy, args, y_clean):
-        """
-        probs:    校正階段的預測機率
-        y_noisy:  混入雜訊階段的標籤 (Input)
-        y_clean:  資料乾淨階段的標籤 (Ground Truth)
-        """
+    
         
-        # 1. 執行校正邏輯 (取得 y_corrected)
-        band = (0.5 - args.epsilon, 0.5 + args.epsilon)
-        probs = np.nan_to_num(probs, nan=0.5)
-        
-        # 生成校正後的標籤 (Soft labels)
-        y_corrected_soft = np.where(probs > 0.5 + args.epsilon, 1.0,
-                        np.where(probs < 0.5 - args.epsilon, 0.0, 
-                        probs))
-        
-        # 為了進行 0/1 狀態比對，我們將校正結果轉為硬標籤
-        # 注意：這裡假設 soft label > 0.5 就是 1，您可以依需求調整
-        y_corrected = (y_corrected_soft > 0.5).astype(int)
-        
-        # 確保輸入都是 numpy int 格式
-        if hasattr(y_clean, 'cpu'): y_clean = y_clean.cpu().numpy().astype(int)
-        if hasattr(y_noisy, 'cpu'): y_noisy = y_noisy.cpu().numpy().astype(int)
-        
-        # 2. 計算三階段狀態碼 (Magic Code)
-        # Code = Clean(4) + Noisy(2) + Corrected(1)
-        # 例如: 101 -> 4 + 0 + 1 = 5
-        state_codes = (y_clean << 2) | (y_noisy << 1) | y_corrected
-        
-        # 3. 統計與分類
-        stats = {
-            # --- (A) 成功修復 (原本有雜訊 -> 修好了) ---
-            '101 (校正對了)': np.sum(state_codes == 5), # Clean=1, Noisy=0, Corr=1
-            '010 (校正對了)': np.sum(state_codes == 2), # Clean=0, Noisy=1, Corr=0
-            
-            # --- (B) 破壞性校正 (原本沒雜訊 -> 改壞了) ---
-            '110 (校正錯了)': np.sum(state_codes == 6), # Clean=1, Noisy=1, Corr=0
-            '001 (校正錯了)': np.sum(state_codes == 1), # Clean=0, Noisy=0, Corr=1
-            
-            # --- (C) 無效校正/漏改 (原本有雜訊 -> 沒修到) ---
-            '100 (沒校正到)': np.sum(state_codes == 4), # Clean=1, Noisy=0, Corr=0
-            '011 (沒校正到)': np.sum(state_codes == 3), # Clean=0, Noisy=1, Corr=1
-            
-            # --- (D) 正確保持 (原本沒雜訊 -> 保持原樣) ---
-            '111 (不需要校正)': np.sum(state_codes == 7),
-            '000 (不需要校正)': np.sum(state_codes == 0),
-        }
-
-        # 4. 漂亮的打印輸出
-        # print(f"\n{'='*10} Correction Analysis {'='*10}")
-        # print(f"Total Samples: {len(y_clean)}")
-        
-        # print(f"\n[🟢 Success - 雜訊成功被移除]")
-        # print(f"  101 (原本是1, 變成0, 修回1): {stats['101 (校正對了)']}")
-        # print(f"  010 (原本是0, 變成1, 修回0): {stats['010 (校正對了)']}")
-        
-        # print(f"\n[🔴 Damage - 乾淨資料被改壞]")
-        # print(f"  110 (原本是1, 沒變, 卻改成0): {stats['110 (校正錯了)']}")
-        # print(f"  001 (原本是0, 沒變, 卻改成1): {stats['001 (校正錯了)']}")
-        
-        # print(f"\n[⚠️ Missed - 雜訊依然存在]")
-        # print(f"  100 (原本是1, 變成0, 沒修回來): {stats['100 (沒校正到)']}")
-        # print(f"  011 (原本是0, 變成1, 沒修回來): {stats['011 (沒校正到)']}")
-        
-        # print(f"\n[⚪ Keep - 正確保持不動]")
-        # print(f"  111 & 000 (資料原本乾淨且未被修改): {stats['111 (不需要校正)'] + stats['000 (不需要校正)']}")
-        # print(f"{'='*40}\n")
-
-        return y_corrected_soft
     def _apply_band_correction(self, probs,y, args):
         """
         內部 helper：套用 epsilon band 進行數值校正
@@ -639,20 +1481,29 @@ class GMMNoiseFilter(BaseNoiseFilter):
     
 
     def correction_perlabel(self, scores, labels, args):
-        print(f"[{self.__class__.__name__}] Running Per-Label GMM Correction...")
+        # 依 args.Noise_type 決定要修哪些子集：
+        #   'FP' → 只修 y=1 子集（雜訊只在 positives 上，y=0 不該動）
+        #   'FN' → 只修 y=0 子集
+        #   'ALL'（或未設定）→ 兩邊都修，維持舊行為
+        noise_type = getattr(args, 'Noise_type', 'ALL')
+        correct_pos = noise_type in ('FP', 'ALL')
+        correct_neg = noise_type in ('FN', 'ALL')
+        print(f"[{self.__class__.__name__}] Running Per-Label GMM Correction... "
+              f"noise_type={noise_type}  correct_pos={correct_pos}  correct_neg={correct_neg}")
+
         scores = np.asarray(scores, dtype=float)
         labels = np.asarray(labels, dtype=int)
         scores = np.nan_to_num(scores, nan=1.0, posinf=1.0, neginf=0.0)
-        
+
         N, num_classes = scores.shape
-        
+
         # 建立輸出的矩陣 (複製一份)
         refined_labels = labels.astype(float).copy()
-        
+
         # 用來統計進度的 bar
         iterator = range(num_classes)
         # 如果類別很多，可以考慮用 tqdm 包起來: tqdm(range(num_classes), desc="Label Correction")
-        
+
         # 2. 針對每一個類別 (Column) 獨立處理
         for c in iterator:
 
@@ -663,66 +1514,67 @@ class GMMNoiseFilter(BaseNoiseFilter):
             "pos_flipped_to_neg": 0, # 1 -> 0 (找出假正例)
             "neg_flipped_to_pos": 0, # 0 -> 1 (找出假負例)
             "soft_labels": 0,        # 變成 0.x (不確定)
-            
+
         }
             # 取出第 c 個類別的所有樣本數據
             col_scores = scores[:, c]  # [N]
             col_labels = labels[:, c]  # [N]
-            
+
             # 定義 Mask
             pos_f = 1
             neg_f = 0
 
             pos_mask = (col_labels == pos_f)
             neg_mask = (col_labels == neg_f)
-            
+
             # -------------------------------------------
             # (A) 該類別的正樣本 (Positive) 校正
             # -------------------------------------------
             pos_scores_c = col_scores[pos_mask]
-            
+            stats['pos_origin'] = len(pos_scores_c)
+
             # 只有當該類別的正樣本夠多時，才跑 GMM (避免 sample 太少 GMM 炸開)
             target_watch_list = args.targert_list  # 你可以指定一些類別來畫圖檢查
-            if len(pos_scores_c) > 1:
+            if correct_pos and len(pos_scores_c) > 1:
                 prob_clean = self._run_gmm_on_subset(pos_scores_c)
                 if c in target_watch_list:
                     # 顯示結果
-                    visualize_gmm(pos_scores_c, class_name=c, subset_type=f"Pos_Original{args.alpha}",save_dir=f"gmm_debug_plots{args.alpha}")
+                    visualize_gmm(pos_scores_c, class_name=c, subset_type=f"Pos_Original{args.alpha}",save_dir=f"gmm_debug_plots{args.alpha}", label_index_path=getattr(args, 'label_index_path', 'dataset/AAPD/label_to_index.json'))
                 if prob_clean is not None:
                     # 2. 傳入機率，Target=1.0
                     # Prob高(乾淨) -> 維持 1
                     # Prob低(雜訊) -> 翻轉為 0
                     new_pos = self._apply_band_correction(prob_clean, 1.0, args)
                     refined_labels[pos_mask, c] = new_pos
-                # --- 統計變化 ---
-                # 原本是 1，變成了 0 (完全翻轉)
-                flipped_0 = np.sum(new_pos == 0.0)
-                # 變成了軟標籤 (0 < x < 1)
-                soft = np.sum((new_pos > 0.0) & (new_pos < 1.0))
-                stats['pos_origin'] = len(pos_scores_c)
-                stats["pos_flipped_to_neg"] += flipped_0
-                stats["soft_labels"] += soft
+                    # --- 統計變化 ---
+                    # 原本是 1，變成了 0 (完全翻轉)
+                    flipped_0 = np.sum(new_pos == 0.0)
+                    # 變成了軟標籤 (0 < x < 1)
+                    soft = np.sum((new_pos > 0.0) & (new_pos < 1.0))
+                    stats["pos_flipped_to_neg"] += flipped_0
+                    stats["soft_labels"] += soft
             # -------------------------------------------
             # (B) 該類別的負樣本 (Negative) 校正
             neg_scores_c = col_scores[neg_mask]
-            if len(neg_scores_c) > 1:
+            stats['neg_origin'] = len(neg_scores_c)
+
+            if correct_neg and len(neg_scores_c) > 1:
                 prob_clean = self._run_gmm_on_subset(neg_scores_c)
                 if c in target_watch_list:
 
-                    visualize_gmm(neg_scores_c, class_name=c, subset_type=f"Neg_Original{args.alpha}",save_dir=f"gmm_debug_plots{args.alpha}")
+                    visualize_gmm(neg_scores_c, class_name=c, subset_type=f"Neg_Original{args.alpha}",save_dir=f"gmm_debug_plots{args.alpha}", label_index_path=getattr(args, 'label_index_path', 'dataset/AAPD/label_to_index.json'),encoder_name=args.encoder_name)
                 if prob_clean is not None:
                     # 2. 傳入機率，Target=0.0
                     # Prob高(乾淨) -> 維持 0
                     # Prob低(雜訊) -> 翻轉為 1
                     new_neg = self._apply_band_correction(prob_clean, 0.0, args)
                     refined_labels[neg_mask, c] = new_neg
-                # --統計
-                flipped_1 = np.sum(new_neg == 1.0)
-                # 變成了軟標籤
-                soft = np.sum((new_neg > 0.0) & (new_neg < 1.0))
-                stats['neg_origin'] =len(neg_scores_c)
-                stats["neg_flipped_to_pos"] += flipped_1
-                stats["soft_labels"] += soft
+                    # --統計
+                    flipped_1 = np.sum(new_neg == 1.0)
+                    # 變成了軟標籤
+                    soft = np.sum((new_neg > 0.0) & (new_neg < 1.0))
+                    stats["neg_flipped_to_pos"] += flipped_1
+                    stats["soft_labels"] += soft
             # --- 每個類別的校正報告 ---
             logger.info(f"  [Label {c} Correction Report]")
             logger.info(f"    - Original Positives: {stats['pos_origin']}, Negatives: {stats['neg_origin']}")
@@ -891,11 +1743,12 @@ class LabelRefiner:
                     if c in target_watch_list and prob_dict is not None:
                         subset_type = f"{'Pos' if target_y == 1 else 'Neg'}_Original{getattr(args, 'alpha', '')}"
                         visualize_gmm(
-                            subset_scores, 
-                            class_name=c, 
+                            subset_scores,
+                            class_name=c,
                             subset_type=subset_type,
                             save_dir=save_dir,
-                            n_components=self.n_components
+                            n_components=self.n_components,
+                            label_index_path=getattr(args, 'label_index_path', 'dataset/AAPD/label_to_index.json')
                         )
                     
                     if prob_dict is not None:
@@ -917,3 +1770,193 @@ class LabelRefiner:
         logger.info(f" Label {c} | Orig P/N: {stats['pos_orig']}/{stats['neg_orig']} | "
                          f"Flipped: 1->0:{stats['1->0']}, 0->1:{stats['0->1']} | Soft: {stats['soft']}")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ablation building blocks (per-cell BCE, Stage1 flipper, GMM(3) intersection)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StandardLossPerCellCalculator(BaseScoreCalculator):
+    """
+    Per-cell BCE loss [N, C]，drop-in for HSMHybridPipeline 的 rel_calculator slot。
+    跟 RankWeightedLossCalculator 一致：回傳 (indices, scores[N,C], labels[N,C])。
+    用於 HSM (a) BCE-only ablation。
+    """
+    def calculate(self, model, dataloader, device):
+        model.eval()
+        scores, indices, labels = [], [], []
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Calculating Per-cell BCE Loss"):
+                b_ids   = batch['input_ids'].to(device)
+                b_mask  = batch['attention_mask'].to(device)
+                b_lbl   = batch['labels'].to(device)
+                b_idx   = batch['index']
+
+                logits, _ = model(input_ids=b_ids, attention_mask=b_mask)
+                loss = F.binary_cross_entropy_with_logits(
+                    logits, b_lbl.float(), reduction='none'
+                )  # [B, C]
+
+                scores.append(loss.cpu().numpy())
+                indices.extend(b_idx.numpy())
+                labels.append(b_lbl.cpu().numpy())
+
+        return np.array(indices), np.vstack(scores), np.vstack(labels)
+
+
+class StageOneRELFlipper:
+    """
+    Stage 1 (FP only): 對每個 label c，挑 noisy_labels[:, c] == 1 的樣本中
+    REL 分數最高的 top_ratio，把 cell 翻成 0。
+
+    與 RELOnlyCorrector.correct() 邏輯一致，但回傳 (flipped_labels, flip_mask)
+    讓上層 (TwoStagePipeline) 知道哪些 cell 被翻了。
+    """
+    def __init__(self, top_ratio: float = 0.01):
+        self.top_ratio = top_ratio
+
+    def apply(self, rel_scores: np.ndarray, noisy_labels: np.ndarray):
+        rel    = np.asarray(rel_scores, dtype=float)
+        labels = np.asarray(noisy_labels, dtype=int)
+        N, C   = labels.shape
+        flipped   = labels.astype(np.float32).copy()
+        flip_mask = np.zeros_like(labels, dtype=bool)
+
+        total = 0
+        for c in range(C):
+            pos_idx = np.where(labels[:, c] == 1)[0]
+            if len(pos_idx) < 4:
+                continue
+            top_k = max(1, int(len(pos_idx) * self.top_ratio))
+            local_top = np.argsort(rel[pos_idx, c])[-top_k:]
+            cand = pos_idx[local_top]
+            flipped[cand, c]    = 0.0
+            flip_mask[cand, c]  = True
+            total += len(cand)
+
+        logger.info(f"[StageOneRELFlipper] top_ratio={self.top_ratio} flipped {total} cells "
+                    f"({total / max(labels.sum(), 1):.2%} of positive cells)")
+        return flipped, flip_mask
+
+
+class IntersectionGMM3Filter:
+    """
+    對每個 label c，分別在 cd_scores[:, c] 與 gap_scores[:, c] 上 fit GMM(n=3)，
+    把「平均分數最高那群」當作 suspicious cluster (high-suspect)，回傳兩個 mask；
+    intersect() 取 AND。
+
+    僅在 noisy_labels[:, c] == 1 的子集上 fit (因為 score 經過 *(2y-1) sign convention，
+    label==0 的樣本意義不同)，未被 fit 的 cell 視為 not-suspicious。
+    """
+    def __init__(self, n_components: int = 3, min_positives: int = 6):
+        self.n_components = n_components
+        self.min_positives = min_positives
+
+    def _suspicious_mask_one(self, score_col: np.ndarray,
+                              label_col: np.ndarray) -> np.ndarray:
+        """單一 label：回傳該 label 的 [N] bool mask."""
+        N = score_col.shape[0]
+        mask = np.zeros(N, dtype=bool)
+        pos_idx = np.where(label_col == 1)[0]
+        if len(pos_idx) < self.min_positives:
+            return mask  # 不足以 fit，全部視為 not suspicious
+
+        x = score_col[pos_idx].reshape(-1, 1)
+        # 若 variance 過低 GMM 會失敗，加 reg_covar 緩衝
+        try:
+            gmm = GMM(n_components=self.n_components, max_iter=200, tol=1e-3,
+                      reg_covar=1e-4, random_state=0)
+            gmm.fit(x)
+        except Exception as e:
+            logger.warning(f"[IntersectionGMM3Filter] GMM fit failed: {e}; skip.")
+            return mask
+
+        # 平均分數最高的 component → suspicious cluster
+        means = gmm.means_.flatten()
+        suspect_comp = int(np.argmax(means))
+        labels_pred = gmm.predict(x)
+        suspect_local = (labels_pred == suspect_comp)
+        mask[pos_idx[suspect_local]] = True
+        return mask
+
+    def fit_predict_suspicious_mask(self,
+                                    score_matrix: np.ndarray,
+                                    labels: np.ndarray) -> np.ndarray:
+        """回傳 [N, C] bool mask = 該 cell 落在 per-label GMM 最可疑那群。"""
+        score_matrix = np.asarray(score_matrix, dtype=float)
+        labels       = np.asarray(labels, dtype=int)
+        N, C = score_matrix.shape
+        out  = np.zeros((N, C), dtype=bool)
+        for c in range(C):
+            out[:, c] = self._suspicious_mask_one(score_matrix[:, c], labels[:, c])
+        return out
+
+    def intersect(self,
+                  cd_scores: np.ndarray,
+                  gap_scores: np.ndarray,
+                  labels: np.ndarray) -> np.ndarray:
+        """CD ∩ Gap suspicious masks (AND)."""
+        cd_mask  = self.fit_predict_suspicious_mask(cd_scores, labels)
+        gap_mask = self.fit_predict_suspicious_mask(gap_scores, labels)
+        inter    = cd_mask & gap_mask
+        logger.info(f"[IntersectionGMM3Filter] cd_mask={cd_mask.sum()} "
+                    f"gap_mask={gap_mask.sum()} intersect={inter.sum()}")
+        return inter
+
+
+class TwoStagePipeline:
+    """
+    Your method orchestrator:
+        Stage 1 (optional): RELTopK flip on per-label top top_ratio (FP only)
+        Stage 2 (optional): CD GMM(3) ∩ Gap GMM(3) suspicious cells →
+            'flip'    : 翻轉這些 cells
+            'discard' : 把這些 cells 從 BCE loss mask 掉 (cell-level)
+            'none'    : 不動
+
+    Returns
+    -------
+    final_labels : [N, C] float32  (Stage1 flipped, Stage2 conditionally flipped)
+    loss_mask    : [N, C] float32  (1=參與 BCE loss, 0=丟棄)
+    """
+    def __init__(self,
+                 use_stage1: bool = True,
+                 stage2_action: str = 'flip',
+                 top_ratio: float = 0.01,
+                 n_components: int = 3):
+        assert stage2_action in ('flip', 'discard', 'none')
+        self.use_stage1    = use_stage1
+        self.stage2_action = stage2_action
+        self.top_ratio     = top_ratio
+        self.n_components  = n_components
+
+    def run(self,
+            rel_scores: np.ndarray,
+            cd_scores: np.ndarray,
+            gap_scores: np.ndarray,
+            noisy_labels: np.ndarray):
+        labels = np.asarray(noisy_labels, dtype=np.float32).copy()
+        N, C   = labels.shape
+        loss_mask = np.ones((N, C), dtype=np.float32)
+
+        # ── Stage 1 ──────────────────────────────────────────────
+        if self.use_stage1:
+            flipper = StageOneRELFlipper(top_ratio=self.top_ratio)
+            labels, _ = flipper.apply(rel_scores, labels.astype(int))
+            labels = labels.astype(np.float32)
+
+        # ── Stage 2 ──────────────────────────────────────────────
+        if self.stage2_action == 'none':
+            return labels, loss_mask
+
+        gmm_filter = IntersectionGMM3Filter(n_components=self.n_components)
+        # 在「Stage 1 已翻轉後」的 labels 上做 Stage 2 (依舊只看正類 cells)
+        susp_mask = gmm_filter.intersect(cd_scores, gap_scores, labels.astype(int))
+
+        if self.stage2_action == 'flip':
+            # 翻轉 (對 cell): 1→0 / 0→1
+            labels[susp_mask] = 1.0 - labels[susp_mask]
+        elif self.stage2_action == 'discard':
+            loss_mask[susp_mask] = 0.0
+
+        logger.info(f"[TwoStagePipeline] use_stage1={self.use_stage1} "
+                    f"stage2={self.stage2_action} affected={int(susp_mask.sum())} cells")
+        return labels, loss_mask
